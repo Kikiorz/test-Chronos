@@ -1,0 +1,19 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: Chronos
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Checkpoint and Scaler paths
+# 使用绝对路径或相对于项目根目录的路径
+ckpt_path: "policy/Chronos/checkpoints/cover_blocks/EE_16/last.ckpt" 
+scaler_path: "/home/sutai/data2/ZYL/RMBench/scaler_cover_blocks_ee_3d.pth"
+
+# Model Config
+temporal_agg: true
+gpu_id: 0
+
+# Add Parameters You Need
+
