@@ -7,6 +7,8 @@ Official implementation of **Chronos: A Physics-Informed Full-History Framework 
 Chronos is a physics-informed full-history imitation learning framework for memory-dependent long-horizon manipulation. It treats observation history as the latent state of the policy dynamics and refines multimodal action priors through a second-order Schrödinger-inspired acceleration bridge.
 <img width="2408" height="837" alt="e39d25de-303e-4b0d-aa4f-c7e9f2f195bf" src="https://github.com/user-attachments/assets/be021f1c-61ca-4cb4-9568-540af040f397" />
 
+In experiments, Chronos achieves **73.6%** average success on RMBench, outperforming Mem-0 by **+22.8 percentage points** with **30x fewer parameters**, and reaches **78%** average success while pi0.5 reaches **7%** in 4 real-world dual-arm experiments.
+
 This repository provides the RMBench-based Chronos implementation. The included `RMBench/` folder contains the benchmark environment, and the Chronos policy is located at `RMBench/policy/Chronos`. Other RMBench policy folders may also be included for convenience. For the environment setup and configuration of other RMBench policies, please refer to the official RMBench repository: https://github.com/robotwin-Platform/rmbench.
 
 ## News
