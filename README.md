@@ -1,6 +1,6 @@
-# Chronos
+# Chronos: A Physics-Informed Full-History Framework for Non-Markovian Long-Horizon Manipulation
 
-Official implementation of **Chronos: A Physics-Informed Full-History Framework for Non-Markovian Long-Horizon Manipulation**.
+This is the official implementation of our paper, which has been submitted to **IEEE Transactions on Robotics (T-RO)**.
 
 [arXiv](https://arxiv.org/abs/2606.30318) | [Code](https://github.com/yulinzhouZYL/Chronos)
 
