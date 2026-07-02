@@ -2,7 +2,7 @@
 
 This is the official implementation of our paper, which has been submitted to **IEEE Transactions on Robotics (T-RO)**.
 
-[arXiv](https://arxiv.org/abs/2606.30318) | [Code](https://github.com/yulinzhouZYL/Chronos)
+[Project Website](https://chronos-manipulation.github.io/) | [arXiv](https://arxiv.org/abs/2606.30318) | [Code](https://github.com/yulinzhouZYL/Chronos)
 
 Chronos is a physics-informed full-history imitation learning framework for memory-dependent long-horizon manipulation. It treats observation history as the latent state of the policy dynamics and refines multimodal action priors through a second-order Schrödinger-inspired acceleration bridge.
 <img width="2408" height="837" alt="e39d25de-303e-4b0d-aa4f-c7e9f2f195bf" src="https://github.com/user-attachments/assets/be021f1c-61ca-4cb4-9568-540af040f397" />
