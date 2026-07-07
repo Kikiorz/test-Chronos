@@ -9,20 +9,21 @@ Chronos is a physics-informed full-history imitation learning framework for memo
 
 In experiments, Chronos achieves **73.6%** average success on RMBench, outperforming Mem-0 by **+22.8 percentage points** with **30x fewer parameters**, and reaches **78%** average success while pi0.5 reaches **7%** in 4 real-world dual-arm experiments.
 
-This repository provides the RMBench-based Chronos implementation. The included `RMBench/` folder contains the benchmark environment, and the Chronos policy is located at `RMBench/policy/Chronos`. Other RMBench policy folders may also be included for convenience. For the environment setup and configuration of other RMBench policies, please refer to the official RMBench repository: https://github.com/robotwin-Platform/rmbench.
+This repository provides the Chronos implementation for both RMBench simulation experiments and real-world dual-arm robot experiments. The included `RMBench/` folder contains the RMBench benchmark environment, and the Chronos simulation policy is located at `RMBench/policy/Chronos`. The `real_wolrd/` folder contains the real-world dual-arm UR3 code, including data collection, training, and closed-loop inference scripts. Other RMBench policys like pi0.5 and Mem-0 also be included for convenience. For the environment setup and configuration of other RMBench policies, please refer to the official RMBench repository: https://github.com/robotwin-Platform/rmbench.
 
 ## News
 
-- **2026-06**: Initial public release of Chronos on RMBench.
-- **Coming soon**: ALOHA code, RoboTwin 2.0 experiment scripts, real-world dual-arm deployment code, pretrained checkpoints, and full experiment configs.
+- **2026-07-07**: Real-world dual-arm UR3 Chronos code released, including data collection, training, and closed-loop inference.
+- **2026-06-30**: RMBench-based Chronos policy code released.
+- **2026-06-29**: Chronos paper released on arXiv.
+---
 
 ## Repository Structure
-
 ```text
 Chronos/
 ├── README.md
 ├── LICENSE
-└── RMBench/
+├── RMBench/
     ├── assets/
     ├── data/
     ├── description/
@@ -40,176 +41,483 @@ Chronos/
     ├── script/
     ├── task_config/
     └── collect_data.sh
+├──real_wolrd/ 
 ```
 
-The current release focuses on the RMBench implementation of Chronos. ALOHA, RoboTwin 2.0, real-world deployment code, pretrained checkpoints, and additional experiment configurations will be released in later updates.
+The repository is organized as one unified Chronos codebase. The current release includes both the RMBench simulation implementation and the real-world dual-arm implementation.
 
-## Installation
+---
 
-Create and activate the Chronos environment:
+## Code Release Status
+
+### Released
+
+- RMBench-based Chronos policy implementation.
+- RMBench data collection, scaler fitting, training, and evaluation workflow.
+- Real-world dual-arm UR3 image-policy code.
+- Real-world data collection scripts.
+- Real-world Chronos training scripts.
+- Real-world Chronos closed-loop inference scripts.
+- Real-world dataset loader and scaler fitting utility.
+- Pose10d-style action preprocessing and validation utilities.
+- RealSense, Kinect, RTDE, SpaceMouse, gripper, and TCP/EE helper modules.
+- Shared-memory utilities for real-world hardware subprocesses.
+
+### Coming Soon
+
+- Cleaned ALOHA benchmark code.
+- Cleaned RoboTwin2.0 benchmark code.
+This repository will continue to grow. The current release focuses on making the main RMBench and real-world Chronos pipelines available first.
+
+# Installation
+
+## Base Environment
+
+Create a conda environment:
 
 ```bash
 conda create -n Chronos python=3.10 -y
 conda activate Chronos
 ```
 
-Enter the included RMBench directory:
+The RMBench and real-world code have different dependency requirements. Please install dependencies according to the experiment you want to run.
+
+---
+
+# RMBench Simulation Experiments
+
+The `RMBench/` folder contains the RMBench environment and the Chronos policy implementation. The Chronos policy is located under:
+
+```text
+RMBench/policy/Chronos
+```
+
+This release focuses on Chronos. For other RMBench baseline policies and their environment configurations, please refer to the official RMBench repository:
+
+```text
+https://github.com/RoboTwin-Platform/RMBench
+```
+
+## Install RMBench Dependencies
+
+Enter the RMBench folder:
 
 ```bash
 cd RMBench
 ```
 
-Install the RMBench simulation environment and dependencies:
+Install basic conda dependencies and CuRobo:
 
 ```bash
 bash script/_install.sh
 ```
 
-Download RMBench assets and data:
+Download assets:
 
 ```bash
 bash script/_download_assets.sh
+```
+
+Download data if needed:
+
+```bash
 bash script/_download_data.sh
 ```
 
-## Mamba Dependencies
-
-Chronos uses a Mamba-based full-history state encoder. After installing the RMBench environment, install the Mamba-related dependencies:
+If you encounter Hugging Face rate limits, log in first:
 
 ```bash
-pip install causal-conv1d>=1.4.0 --no-build-isolation
-pip install mamba-ssm --no-build-isolation
-pip install einops torchvision huggingface_hub
+huggingface-cli login
 ```
 
-If installation fails, please check that your PyTorch, CUDA, and compiler versions are compatible with `mamba-ssm` and `causal-conv1d`.
+## Collect RMBench Data
 
-## Data Collection Example
-
-The following example uses the RMBench `cover_blocks` task with the `demo_clean` configuration.
-
-From the `RMBench` root directory, collect demonstrations:
+For example, collect demonstrations for `cover_blocks`:
 
 ```bash
 bash collect_data.sh cover_blocks demo_clean 0
 ```
 
-For the current release, we use 55 demonstrations. After data collection, create a dataset split with two folders:
+After data collection, create a dataset folder with train/test splits:
 
 ```text
-train/
-test/
+/path/to/cover_blocks/
+  train/
+  test/
 ```
 
-Place 50 demonstrations into `train/` and 5 demonstrations into `test/`. The trajectory file format should remain unchanged.
-
-A typical structure is:
+For example, put 50 trajectories into:
 
 ```text
-RMBench/
-└── data/
-    └── cover_blocks/
-        └── demo_clean/
-            ├── train/
-            └── test/
+/path/to/cover_blocks/train/
 ```
 
-If your RMBench data path differs, please update the corresponding paths in the Chronos dataset script before training.
+and 5 trajectories into:
 
-## Dataset Normalization
+```text
+/path/to/cover_blocks/test/
+```
 
-Before training, generate the normalization/statistics file:
+## Fit RMBench Normalization Statistics
+
+Enter the Chronos policy folder:
 
 ```bash
-python policy/Chronos/M_dataset_robotwin3D_E.py
+cd RMBench/policy/Chronos
 ```
 
-Please check the task name, task configuration, and dataset path inside the script before running. The default example is intended for:
-
-```text
-task_name   = cover_blocks
-task_config = demo_clean
-```
-
-## Training
-
-Start Chronos training with:
+Generate the normalization/scaler file:
 
 ```bash
-python policy/Chronos/train_par_3D_IMLE_EE.py
+python M_dataset_robotwin3D_E.py \
+  --task-name cover_blocks \
+  --data-root /path/to/cover_blocks/train \
+  --output-dir ./scalers
 ```
 
-The current RMBench release trains the 3D point-cloud Chronos policy with:
+Please adjust the output scaler name according to your local script configuration.
 
-- full-history Mamba state encoding,
-- IMLE coarse action prior generation,
-- second-order acceleration-field refinement,
-- end-effector action prediction.
+## Train Chronos on RMBench
 
-Checkpoints are expected to be saved under:
-
-```text
-policy/Chronos/checkpoints/cover_blocks/EE_16/
-```
-
-## Evaluation
-
-After training, run evaluation from the Chronos policy directory:
+Run:
 
 ```bash
-cd policy/Chronos
+python train_par_3D_IMLE_EE.py \
+  --task-name cover_blocks \
+  --data-root /path/to/cover_blocks \
+  --scaler-path ./scalers/scaler_cover_blocks.pth \
+  --devices 0
+```
+
+Please adjust paths according to your local dataset and scaler names.
+
+## Evaluate Chronos on RMBench
+
+From the Chronos policy folder, run:
+
+```bash
 bash eval.sh cover_blocks demo_clean Chronos 42 0
 ```
 
-The arguments are:
+Arguments:
 
 ```text
-bash eval.sh <task_name> <task_config> <ckpt_name> <seed> <gpu_id>
+task name     : cover_blocks
+data setting  : demo_clean
+policy name   : Chronos
+seed          : 42
+GPU id        : 0
 ```
 
-Example:
+---
+
+# Real-World Dual-Arm Experiments
+
+The `real_wolrd/` folder contains the real-world data collection, training, and inference code for the dual-arm UR3 Chronos image policy.
 
 ```text
-task_name   = cover_blocks
-task_config = demo_clean
-ckpt_name   = Chronos
-seed        = 42
-gpu_id      = 0
+real_wolrd/
+  common/                    # Shared model, dataset, hardware, pose, and shared-memory utilities
+  data_collection/           # Real robot data collection and closed-loop robot scripts
+  training/                  # Lightning training entry point
+  inference/                 # Chronos inference wrapper
+  requirements.txt           # Python dependencies
 ```
 
-The evaluation script calls the RMBench evaluation entry point and loads:
+## Real-World Important Files
+
+### Data Collection
 
 ```text
-policy/Chronos/deploy_policy.yml
+data_collection/z_data_collect_chronos.py
 ```
 
-with checkpoints from:
+Real-world data collection entry. It reads D435, Kinect V2, two UR3 arms, SpaceMouse, and the dual gripper, then saves trajectories to the training dataset format.
+
+### Closed-Loop Robot Execution
 
 ```text
-policy/Chronos/checkpoints/<task_name>/EE_16/
+data_collection/z_chronos.py
 ```
 
-## Current Release Scope
+Real-world closed-loop execution entry. It loads a trained Chronos checkpoint and runs manual or policy control on the robot.
 
-Available now:
+### Training
 
-- RMBench-compatible Chronos policy code
-- 3D point-cloud Chronos implementation
-- full-history Mamba state encoder
-- IMLE coarse action prior generator
-- second-order acceleration-field refinement module
-- RMBench training and evaluation entry points
+```text
+training/train_par_3D_IMLE_UR3.py
+```
 
-Coming soon:
+Main training script for the image + low-dimensional dual-arm policy.
 
-- ALOHA benchmark code
-- RoboTwin 2.0 experiment scripts
-- real-world dual-arm deployment code
-- pretrained checkpoints
-- full configuration files
-- additional documentation and troubleshooting guide
+### Inference Wrapper
 
-## Citation
+```text
+inference/inference_choronos.py
+```
+
+`MyInferenceModel` wrapper. It loads checkpoint/scaler, preprocesses image and pose observations, and returns 20D pose10d-style actions.
+
+### Policy Network
+
+```text
+common/mamba_policy_par_2D_IMLE.py
+```
+
+Chronos/Mamba policy network.
+
+### Dataset and Scaler
+
+```text
+common/M_dataset_real_UR3.py
+common/scaler_M.py
+```
+
+Dataset loader, scaler fitting utility, and low-dimensional observation/action normalizer.
+
+### Metrics
+
+```text
+common/metric_UR10D.py
+```
+
+Pose10d validation metrics.
+
+### Hardware Helpers
+
+```text
+common/z_*.py
+```
+
+RealSense, Kinect, RTDE, SpaceMouse, gripper, and TCP/EE transform helpers.
+
+### Shared Memory
+
+```text
+common/shared_memory_dp/
+```
+
+Shared-memory queues, ring buffers, and arrays used by hardware subprocesses.
+
+## Install Real-World Dependencies
+
+Enter the real-world code folder:
+
+```bash
+cd real_wolrd
+```
+
+Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Some hardware dependencies require system drivers or vendor SDKs in addition to Python packages:
+
+- Intel RealSense SDK
+- Kinect V2 / libfreenect2
+- UR RTDE
+- SpaceMouse / spacenav
+- Dynamixel SDK
+
+Please verify all hardware devices and emergency stop mechanisms before running closed-loop control.
+
+## Real-World Dataset Format
+
+Each trajectory folder should contain:
+
+```text
+pose.npy              # left arm actual TCP pose, [T, 6]
+pose2.npy             # right arm actual TCP pose, [T, 6]
+target_pose.npy       # left arm target TCP pose, [T, 6]
+target_pose2.npy      # right arm target TCP pose, [T, 6]
+gripper.npy           # left gripper target, [T]
+gripper2.npy          # right gripper target, [T]
+gripper_pos.npy       # left gripper measured position, [T]
+gripper_pos2.npy      # right gripper measured position, [T]
+img/00000.jpg         # D435 RGB frames
+```
+
+The training script expects train/test split folders:
+
+```text
+/path/to/cover_blocks/
+  train/<trajectory folders>
+  test/<trajectory folders>
+```
+
+## Collect Real-World Data
+
+Run:
+
+```bash
+python data_collection/z_data_collect_chronos.py \
+  --robot_ip 192.168.4.63 \
+  --robot_ip2 192.168.4.64 \
+  --d435-serial <D435_SERIAL> \
+  --kinect-serial <KINECT_SERIAL> \
+  --output-root ./datasets/recordings
+```
+
+Useful keys:
+
+```text
+space      start/stop automatic recording
+p          manually append the current frame
+s          save the current recording buffer
+backspace  clear the current buffer
+w          switch active arm
+e          toggle gripper
+0/1/2/3    move to preset poses
+q          quit
+```
+
+After collection, move or copy saved trajectory folders into:
+
+```text
+/path/to/cover_blocks/train/
+```
+
+and:
+
+```text
+/path/to/cover_blocks/test/
+```
+
+## Fit Real-World Scaler
+
+Run:
+
+```bash
+python common/M_dataset_real_UR3.py \
+  --task-name cover_blocks \
+  --data-root /path/to/cover_blocks/train \
+  --output-dir ./scalers
+```
+
+This writes:
+
+```text
+scalers/scaler_cover_blocks_image_pose10d.pth
+```
+
+## Train Real-World Chronos Policy
+
+Run:
+
+```bash
+python training/train_par_3D_IMLE_UR3.py \
+  --task-name cover_blocks \
+  --data-root /path/to/cover_blocks \
+  --output-root . \
+  --scaler-path ./scalers/scaler_cover_blocks_image_pose10d.pth \
+  --devices 0
+```
+
+Checkpoints are saved under:
+
+```text
+checkpoints/<task-name>/S3B_IMAGE_20D_2/
+```
+
+## Run Real-World Policy
+
+Run:
+
+```bash
+python data_collection/z_chronos.py \
+  --robot_ip 192.168.4.63 \
+  --robot_ip2 192.168.4.64 \
+  --ckpt-path ./checkpoints/cover_blocks/S3B_IMAGE_20D_2/last.ckpt \
+  --scaler-path ./scalers/scaler_cover_blocks_image_pose10d.pth \
+  --device cuda:0
+```
+
+Useful keys:
+
+```text
+i              enter policy mode
+z              leave policy mode
+w              switch active arm in manual mode
+e              toggle gripper
+0/1/2/3/4/5/6  move to preset poses
+q              quit
+```
+
+You can also set paths with environment variables:
+
+```bash
+export CHRONOS_CKPT_PATH=/path/to/last.ckpt
+export CHRONOS_SCALER_PATH=/path/to/scaler.pth
+export CHRONOS_RECORD_ROOT=/path/to/new/recordings
+```
+
+---
+
+# Recommended Workflows
+
+## RMBench Workflow
+
+```text
+RMBench data collection
+→ train/test split
+→ scaler fitting
+→ Chronos training
+→ RMBench evaluation
+```
+
+## Real-World Workflow
+
+```text
+hardware setup
+→ real-world data collection
+→ train/test split
+→ scaler fitting
+→ Chronos training
+→ checkpoint validation
+→ closed-loop robot execution
+```
+
+---
+
+# Real-Robot Safety Notes
+
+Before running real-world closed-loop policy execution:
+
+1. Verify robot IP addresses and RTDE connections.
+2. Check camera calibration and image stream stability.
+3. Confirm gripper direction and command range.
+4. Start with low speed and conservative workspace limits.
+5. Keep an emergency stop available.
+6. Test policy behavior in manual or replay mode before enabling autonomous execution.
+7. Inspect predicted poses and gripper commands before long-horizon deployment.
+
+The real-world code is released for research use. Please use it carefully on physical robots.
+
+---
+
+# Troubleshooting
+
+## Video or Image Input Does Not Load
+
+Check camera serial numbers, driver installation, and permissions. For RealSense devices, verify that the Intel RealSense SDK is installed and that the camera can be opened by the official viewer.
+
+## Robot Does Not Move
+
+Check robot IP addresses, RTDE connectivity, robot mode, protective stop state, and workspace/speed limits.
+
+## Policy Output Looks Unstable
+
+Verify that the scaler path matches the training dataset, the observation format matches the training format, and the checkpoint corresponds to the same task.
+
+## Dataset Cannot Be Loaded
+
+Check that each trajectory contains the required `.npy` files and image frames, and that the train/test split follows the expected folder structure.
+
+---
+
+# Citation
 
 If you find Chronos useful, please cite:
 
@@ -221,6 +529,8 @@ If you find Chronos useful, please cite:
   year={2026}
 }
 ```
+
+---
 
 ## Acknowledgement
 
