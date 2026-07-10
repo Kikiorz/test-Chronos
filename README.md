@@ -47,7 +47,20 @@ Chronos/
 The repository is organized as one unified Chronos codebase. The current release includes both the RMBench simulation implementation and the real-world dual-arm implementation.
 
 ---
+## Official RMBench Checkpoint
 
+We provide the official RMBench `demo_clean` checkpoint and scaler at:
+
+```text
+https://huggingface.co/yulinzhouZYL/Chronos-RMBench
+```
+
+This checkpoint uses 16D dual-arm EE pose + gripper actions and should be evaluated with:
+
+```python
+TASK_ENV.take_action(action, action_type="ee")
+```
+This is not a qpos replay checkpoint.
 ## Code Release Status
 
 ### Released
@@ -160,57 +173,110 @@ and 5 trajectories into:
 
 ## Fit RMBench Normalization Statistics
 
-Enter the Chronos policy folder:
+The current scaler script uses internal configuration fields instead of command-line arguments. Please edit the following fields in `RMBench/policy/Chronos/M_dataset_robotwin3D_E.py`:
+
+```python
+TASK_NAME = "cover_blocks"
+SSD_ROOT = "/path/to/your/data/root"
+```
+
+The expected training data path is:
+
+```text
+${SSD_ROOT}/cover_blocks/demo_clean/data/train/
+```
+
+Then run:
 
 ```bash
 cd RMBench/policy/Chronos
+python M_dataset_robotwin3D_E.py
 ```
 
-Generate the normalization/scaler file:
+This generates:
 
-```bash
-python M_dataset_robotwin3D_E.py \
-  --task-name cover_blocks \
-  --data-root /path/to/cover_blocks/train \
-  --output-dir ./scalers
+```text
+scaler_cover_blocks_ee_3d.pth
 ```
 
-Please adjust the output scaler name according to your local script configuration.
+Please keep it under:
 
+```text
+RMBench/policy/Chronos/scaler_cover_blocks_ee_3d.pth
+```
 ## Train Chronos on RMBench
 
-Run:
+The current training script uses internal configuration fields instead of command-line arguments. Please edit the following fields in `RMBench/policy/Chronos/train_par_3D_IMLE_EE.py`:
 
-```bash
-python train_par_3D_IMLE_EE.py \
-  --task-name cover_blocks \
-  --data-root /path/to/cover_blocks \
-  --scaler-path ./scalers/scaler_cover_blocks.pth \
-  --devices 0
+```python
+TASK_NAME = "cover_blocks"
+SSD_ROOT = "/path/to/your/data/root"
+CODE_ROOT = "/path/to/your/Chronos/RMBench"
+SCALER_FILENAME = f"scaler_{TASK_NAME}_ee_3d.pth"
 ```
 
-Please adjust paths according to your local dataset and scaler names.
+Before training, make sure the scaler exists at:
+
+```text
+RMBench/policy/Chronos/scaler_cover_blocks_ee_3d.pth
+```
+
+Then run:
+
+```bash
+cd RMBench/policy/Chronos
+python train_par_3D_IMLE_EE.py
+```
+
+Checkpoints will be saved to:
+
+```text
+RMBench/policy/Chronos/checkpoints/cover_blocks/EE_16/
+```
+
+The expected evaluation checkpoint is:
+
+```text
+RMBench/policy/Chronos/checkpoints/cover_blocks/EE_16/last.ckpt
+```
 
 ## Evaluate Chronos on RMBench
 
-From the Chronos policy folder, run:
+Before evaluation, make sure the checkpoint and scaler are placed as:
+
+```text
+RMBench/policy/Chronos/
+├── scaler_cover_blocks_ee_3d.pth
+├── deploy_policy.yml
+└── checkpoints/
+    └── cover_blocks/
+        └── EE_16/
+            └── last.ckpt
+```
+
+In `RMBench/policy/Chronos/deploy_policy.yml`, set:
+
+```yaml
+ckpt_path: "policy/Chronos/checkpoints/cover_blocks/EE_16/last.ckpt"
+scaler_path: "policy/Chronos/scaler_cover_blocks_ee_3d.pth"
+temporal_agg: true
+gpu_id: 0
+```
+
+Then run:
 
 ```bash
+cd RMBench/policy/Chronos
 bash eval.sh cover_blocks demo_clean Chronos 42 0
 ```
 
-Arguments:
+Chronos is evaluated with EE-pose control:
 
-```text
-task name     : cover_blocks
-data setting  : demo_clean
-policy name   : Chronos
-seed          : 42
-GPU id        : 0
+```python
+TASK_ENV.take_action(action, action_type="ee")
 ```
 
----
-
+Please make sure the checkpoint and `scaler_cover_blocks_ee_3d.pth` come from the same training run.
 # Real-World Dual-Arm Experiments
 
 The `real_wolrd/` folder contains the real-world data collection, training, and inference code for the dual-arm UR3 Chronos image policy.
