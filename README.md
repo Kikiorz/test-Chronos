@@ -13,6 +13,7 @@ This repository provides the Chronos implementation for both RMBench simulation 
 
 ## News
 
+- **2026-07-10**: RMBench-based Chronos policy ckpt and pth released.
 - **2026-07-07**: Real-world dual-arm UR3 Chronos code released, including data collection, training, and closed-loop inference.
 - **2026-06-30**: RMBench-based Chronos policy code released.
 - **2026-06-29**: Chronos paper released on arXiv.
