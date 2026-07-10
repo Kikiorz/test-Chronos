@@ -49,11 +49,9 @@ The repository is organized as one unified Chronos codebase. The current release
 ---
 ## Official RMBench Checkpoint
 
-We provide the official RMBench `demo_clean` checkpoint and scaler at:
+We provide official RMBench Chronos checkpoints and matching normalization files on Hugging Face:
 
-```text
-https://huggingface.co/yulinzhouZYL/Chronos-RMBench
-```
+[Chronos-RMBench Checkpoints](https://huggingface.co/yulinzhouZYL/Chronos-RMBench)
 
 This checkpoint uses 16D dual-arm EE pose + gripper actions and should be evaluated with:
 
