@@ -135,7 +135,7 @@ class LitMambaParallel(pl.LightningModule):
         )
         max_epochs = self.trainer.max_epochs 
         warmup_epochs = 15
-        eta_min = 3e-5
+        eta_min = 2e-5
         
         scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
@@ -434,13 +434,12 @@ def main():
         save_top_k=-1,       # -1 代表不覆盖、不删除之前的周期 ckpt（强制保留每一个百轮节点）
         save_on_train_epoch_end=True # 确保在训练轮次结束时精准触发
     )
-    # 实例化我们的 DP3 同款 EMA Callback
     ema_callback = WarmupEMACallback(max_value=0.9999)
     trainer = pl.Trainer(
         accumulate_grad_batches=3,
         accelerator='gpu', 
         devices=[0], 
-        max_epochs=800, 
+        max_epochs=600, 
         logger=logger,
         callbacks=[checkpoint_callback_best, checkpoint_callback_last, checkpoint_callback_periodic, lr_monitor, ema_callback],
         precision=32, 
