@@ -184,6 +184,8 @@ dmypy.json
 *.h5
 *.hdf5
 events.out.tfevents.*
+*.mp4
+RMBench/eval_result/
 
 # Cython debug symbols
 cython_debug/
