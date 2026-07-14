@@ -316,8 +316,7 @@ def test_resume_contract_binds_embedded_scaler_and_split() -> None:
     run_contract = {
         "backbone_weights_sha256": "a" * 64,
         "scaler_fingerprint": scaler.fingerprint(),
-        "cache_contract_sha256": "b" * 64,
-        "cache_dataset_sha256": "c" * 64,
+        "dataset_manifest_sha256": "b" * 64,
         "split_seed": 42,
         "val_fraction": 0.1,
         "train_episodes": ["episode0.hdf5"],

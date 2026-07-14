@@ -1,4 +1,4 @@
-"""Online DINOv3 RGB controller for native 14-D RMBench joint targets."""
+"""Online ResNet-18 RGB controller for native 14-D RMBench joint targets."""
 
 from __future__ import annotations
 
@@ -12,8 +12,13 @@ import torch
 
 from . import mamba_policy_par_2D_IMLE_Joint
 from .contracts import INFERENCE_SAMPLE_STEPS, JOINT_ORDER, base_policy_contract
-from .dinov3_backbone import DINOV3_CACHE_DEVICE_TYPE
 from .mamba_policy_par_2D_IMLE_Joint import MambaConfig, MambaPolicy
+from .resnet18_backbone import (
+    RESNET18_IMAGE_HW,
+    RESNET18_WEIGHTS_SHA256,
+    RMBENCH_RGB_HW,
+    preprocess_rgb_numpy,
+)
 from .scaler_M import Scaler
 
 
@@ -60,11 +65,6 @@ class MambaRGBJointController:
         self.device = torch.device(str(args.get("device", "cuda:0")))
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device {self.device} was requested, but CUDA is unavailable")
-        if self.device.type != DINOV3_CACHE_DEVICE_TYPE:
-            raise ValueError(
-                "Formal RGB-Joint deployment requires CUDA so online DINOv3 uses "
-                "the cache-validated numerical backend; CPU is not supported."
-            )
 
         self.camera_name = str(args.get("camera_name", "head_camera"))
         self.future_steps = int(args.get("future_steps", 16))
@@ -106,7 +106,7 @@ class MambaRGBJointController:
         self.scaler.to(self.device)
         self.scaler.eval()
 
-        print("[MambaRGBJointController] Initializing DINOv3 RGB Joint MambaPolicy")
+        print("[MambaRGBJointController] Initializing ResNet-18 RGB Joint MambaPolicy")
         self.policy = MambaPolicy(
             camera_names=config.camera_names,
             embed_dim=config.embed_dim,
@@ -158,14 +158,19 @@ class MambaRGBJointController:
         for fingerprint_key in (
             "backbone_weights_sha256",
             "scaler_fingerprint",
-            "cache_contract_sha256",
-            "cache_dataset_sha256",
         ):
             value = contract.get(fingerprint_key)
             if not isinstance(value, str) or len(value) != 64:
                 raise ValueError(
                     f"Checkpoint contract has invalid {fingerprint_key}: {value!r}"
                 )
+        if contract["backbone_weights_sha256"] != RESNET18_WEIGHTS_SHA256:
+            raise ValueError(
+                "Checkpoint was not initialized from the official torchvision "
+                "ResNet-18 weights: "
+                f"checkpoint={contract['backbone_weights_sha256']}, "
+                f"required={RESNET18_WEIGHTS_SHA256}"
+            )
         if contract["scaler_fingerprint"] != self.scaler_fingerprint:
             raise ValueError(
                 "External scaler does not belong to this checkpoint: "
@@ -245,6 +250,49 @@ class MambaRGBJointController:
         values = {key: qpos[:, index:index + 1] for index, key in enumerate(JOINT_KEYS)}
         normalized = self.scaler.normalize(values)
         return torch.cat([normalized[key] for key in JOINT_KEYS], dim=-1).float()
+
+    def _preprocess_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Apply the official real-world RGB preprocessing exactly once.
+
+        ``deploy_policy.encode_obs`` deliberately hands this controller the
+        native RMBench byte frame.  Requiring uint8 and native resolution here
+        makes an accidental prior /255, normalization, resize, or BGR decoder
+        conversion fail loudly instead of silently changing model inputs.
+        """
+
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        expected = (1, 3, *RMBENCH_RGB_HW)
+        if tuple(image.shape) != expected:
+            raise ValueError(f"Expected one native RGB frame {expected}, got {tuple(image.shape)}")
+        if image.dtype != torch.uint8:
+            raise TypeError(
+                "Controller RGB input must be raw torch.uint8; resizing and "
+                "normalization are performed inside the controller exactly once"
+            )
+        image_hwc = (
+            image[0]
+            .detach()
+            .to(device="cpu")
+            .permute(1, 2, 0)
+            .contiguous()
+            .numpy()
+        )
+        normalized_chw = preprocess_rgb_numpy(image_hwc)
+        expected_preprocessed = (3, *RESNET18_IMAGE_HW)
+        if normalized_chw.dtype != np.float32 or normalized_chw.shape != expected_preprocessed:
+            raise RuntimeError(
+                "Shared ResNet-18 preprocessing violated its output contract: "
+                f"dtype={normalized_chw.dtype}, shape={normalized_chw.shape}, "
+                f"expected float32 {expected_preprocessed}"
+            )
+        if not np.isfinite(normalized_chw).all():
+            raise FloatingPointError("Shared ResNet-18 preprocessing produced NaN or infinity")
+        return (
+            torch.from_numpy(np.ascontiguousarray(normalized_chw))
+            .unsqueeze(0)
+            .to(self.device, dtype=torch.float32)
+        )
 
     def _denormalize_sequence(self, actions: torch.Tensor) -> torch.Tensor:
         if actions.shape[-2:] != (self.future_steps, self.action_dim):
@@ -359,18 +407,14 @@ class MambaRGBJointController:
 
     @torch.inference_mode()
     def get_action(self, obs_dict: Mapping[str, torch.Tensor]) -> np.ndarray:
-        image = obs_dict["image"].to(self.device, dtype=torch.float32)
+        image = self._preprocess_image(obs_dict["image"])
         qpos = obs_dict["qpos"].to(self.device, dtype=torch.float32)
-        if image.ndim == 3:
-            image = image.unsqueeze(0)
-        if image.ndim != 4 or image.shape[0] != 1 or image.shape[1] != 3:
-            raise ValueError(f"Expected one NCHW RGB image, got {tuple(image.shape)}")
         if qpos.ndim == 1:
             qpos = qpos.unsqueeze(0)
         if qpos.shape != (1, self.action_dim):
             raise ValueError(f"Expected one 14-D joint target state, got {tuple(qpos.shape)}")
-        if not torch.isfinite(image).all() or image.min() < 0.0 or image.max() > 1.0:
-            raise ValueError("Controller RGB input must be finite and scaled to [0,1]")
+        if not torch.isfinite(image).all():
+            raise FloatingPointError("Preprocessed controller RGB contains NaN or infinity")
         if not torch.isfinite(qpos).all():
             raise ValueError("Controller joint input contains NaN or infinity")
         if not (0.0 - 1e-5 <= qpos[0, 6] <= 1.0 + 1e-5):

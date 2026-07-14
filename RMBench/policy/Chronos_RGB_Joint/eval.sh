@@ -7,7 +7,7 @@ set -euo pipefail
 policy_name="Chronos_RGB_Joint"
 task_name="${1:-cover_blocks}"
 task_config="${2:-demo_clean_rgb_joint}"
-ckpt_setting="${3:-rgb_head_joint14_dinov3b}"
+ckpt_setting="${3:-rgb_head_joint14_resnet18}"
 seed="${4:-42}"
 physical_gpu_id="${5:-0}"
 test_num="${6:-5}"

@@ -1,35 +1,28 @@
-"""Chronos with DINOv3 RGB features and native 14-D RMBench joint control.
+"""Chronos with the released real-world RGB encoder and RMBench joint control.
 
-Only the observation encoder changes relative to ``policy/Chronos``.  The
-Mamba history model, IMLE generator, symplectic action head, and 16-step
-prediction horizon are inherited unchanged.
+The frozen ResNet-18 image path is copied from the released real-world policy.
+The Mamba history model, five-sample RMBench IMLE generator, symplectic action
+head, and 16-step prediction horizon remain the released RMBench implementation.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Sequence
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 try:
-    from .dinov3_backbone import (
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_IMAGE_HW,
-        DINOV3_POOL_HW,
-        DINOv3ImageEncoder,
+    from .resnet18_backbone import (
+        RESNET18_IMAGE_HW,
+        OfficialResNet18Trunk,
     )
 except ImportError:  # direct script execution
-    from dinov3_backbone import (  # type: ignore
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_IMAGE_HW,
-        DINOV3_POOL_HW,
-        DINOv3ImageEncoder,
+    from resnet18_backbone import (  # type: ignore
+        RESNET18_IMAGE_HW,
+        OfficialResNet18Trunk,
     )
 
 
@@ -65,16 +58,12 @@ class MambaConfig(_PointCloudMambaConfig):
         self.num_blocks = 6
         self.pretrained_backbone = True
         self.freeze_backbone = True
-        self.dinov3_image_hw = DINOV3_IMAGE_HW
+        self.image_hw = RESNET18_IMAGE_HW
+        self.image_chunk_size = 256
 
 
 class ImageMambaFusion(nn.Module):
-    """Frozen DINOv3-B/16 plus trainable spatial/proprioceptive fusion.
-
-    Raw images and cached ``[CLS + 4x5 patch-grid]`` tokens use the same adapter.
-    The formal FP32, batch-1 cache matches online extraction's preprocessing and
-    execution shape; a tolerance regression test guards numerical equivalence.
-    """
+    """Released frozen ResNet-18 trunk and trainable RGB/proprio fusion."""
 
     def __init__(
         self,
@@ -83,8 +72,7 @@ class ImageMambaFusion(nn.Module):
         pretrained: bool = True,
         freeze_backbone: bool = True,
         backbone_weights: str | Path | None = None,
-        image_hw: Sequence[int] = DINOV3_IMAGE_HW,
-        spatial_pool: Sequence[int] = DINOV3_POOL_HW,
+        image_hw: tuple[int, int] = RESNET18_IMAGE_HW,
     ):
         super().__init__()
         if embed_dim != 1024:
@@ -94,34 +82,30 @@ class ImageMambaFusion(nn.Module):
             )
         self.embed_dim = int(embed_dim)
         self.proprio_dim = int(proprio_dim)
-        pool_h, pool_w = (int(spatial_pool[0]), int(spatial_pool[1]))
-        if (pool_h, pool_w) != DINOV3_POOL_HW:
+        self.image_hw = tuple(int(value) for value in image_hw)
+        if self.image_hw != RESNET18_IMAGE_HW:
             raise ValueError(
-                f"Cached DINOv3 layout is fixed at {DINOV3_POOL_HW}, got {(pool_h, pool_w)}"
+                f"The official image encoder requires {RESNET18_IMAGE_HW}, "
+                f"got {self.image_hw}"
             )
-        self.image_encoder = DINOv3ImageEncoder(
-            image_hw=image_hw,
-            pool_hw=spatial_pool,
+        self.freeze_backbone = bool(freeze_backbone)
+        self.vision_net = OfficialResNet18Trunk(
             pretrained=pretrained,
             weights_path=backbone_weights,
             freeze=freeze_backbone,
         )
-        self.global_adapter = nn.Sequential(
-            nn.Linear(DINOV3_FEATURE_DIM, 128),
-            nn.LayerNorm(128),
-            nn.SiLU(inplace=True),
-        )
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(DINOV3_FEATURE_DIM, 256, kernel_size=1),
+        self.visual_adapter = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
             nn.GroupNorm(32, 256),
             nn.SiLU(inplace=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(16, 128),
             nn.SiLU(inplace=True),
             nn.Flatten(1),
-            nn.Linear(128 * pool_h * pool_w, 384),
-            nn.LayerNorm(384),
+            nn.Linear(128 * 8 * 10, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
             nn.SiLU(inplace=True),
+            nn.Dropout(0.10),
         )
         self.proprio_projector = nn.Sequential(
             nn.Linear(self.proprio_dim, 128),
@@ -129,47 +113,60 @@ class ImageMambaFusion(nn.Module):
             nn.Linear(128, 512),
             nn.LayerNorm(512),
         )
-        self.fusion_norm = nn.LayerNorm(1024)
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(self.embed_dim + 512, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        )
 
-    def _validate_cached_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        if tokens.ndim != 3 or tuple(tokens.shape[1:]) != (
-            DINOV3_CACHE_TOKENS,
-            DINOV3_FEATURE_DIM,
-        ):
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.vision_net.eval()
+        return self
+
+    def encode_images(self, image: torch.Tensor) -> torch.Tensor:
+        """Run only the frozen official trunk; inputs are already normalized."""
+
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(f"Expected normalized RGB [N,3,H,W], got {tuple(image.shape)}")
+        if tuple(image.shape[-2:]) != self.image_hw:
             raise ValueError(
-                "Expected cached DINOv3 tokens "
-                f"[N,{DINOV3_CACHE_TOKENS},{DINOV3_FEATURE_DIM}], got {tuple(tokens.shape)}"
+                f"Expected official RGB size {self.image_hw}, got {tuple(image.shape[-2:])}"
             )
-        dtype = self.global_adapter[0].weight.dtype
-        tokens = tokens.to(dtype=dtype)
-        if not torch.isfinite(tokens).all():
-            raise FloatingPointError("Cached DINOv3 features contain NaN or Inf")
-        return tokens
+        image = image.to(dtype=self.visual_adapter[0].weight.dtype)
+        if not torch.isfinite(image).all():
+            raise FloatingPointError("Normalized RGB contains NaN or Inf")
+        if self.freeze_backbone:
+            self.vision_net.eval()
+            with torch.no_grad():
+                feature_map = self.vision_net(image)
+        else:
+            feature_map = self.vision_net(image)
+        if tuple(feature_map.shape[1:]) != (512, 15, 20):
+            raise RuntimeError(
+                "Official ResNet-18 trunk must output [N,512,15,20], got "
+                f"{tuple(feature_map.shape)}"
+            )
+        return feature_map
 
-    def forward(self, vision: torch.Tensor, proprio_embed: torch.Tensor) -> torch.Tensor:
+    def fuse_feature_map(
+        self, feature_map: torch.Tensor, proprio_embed: torch.Tensor
+    ) -> torch.Tensor:
+        if feature_map.ndim != 4 or tuple(feature_map.shape[1:]) != (512, 15, 20):
+            raise ValueError(
+                f"Expected ResNet map [N,512,15,20], got {tuple(feature_map.shape)}"
+            )
         if proprio_embed.ndim != 2 or proprio_embed.shape[-1] != self.proprio_dim:
             raise ValueError(
                 f"Expected proprioception [N,{self.proprio_dim}], "
                 f"got {tuple(proprio_embed.shape)}"
             )
-        if vision.ndim == 4:
-            tokens = self.image_encoder(vision)
-        elif vision.ndim == 3:
-            tokens = self._validate_cached_tokens(vision)
-        else:
-            raise ValueError(
-                "Vision input must be raw NCHW/NHWC images or cached DINOv3 tokens; "
-                f"got {tuple(vision.shape)}"
-            )
-        cls = tokens[:, 0]
-        spatial = tokens[:, 1:].reshape(
-            tokens.shape[0], DINOV3_POOL_HW[0], DINOV3_POOL_HW[1], DINOV3_FEATURE_DIM
-        ).permute(0, 3, 1, 2)
-        visual_feature = torch.cat(
-            [self.global_adapter(cls), self.spatial_adapter(spatial)], dim=-1
-        )
+        visual_feature = self.visual_adapter(feature_map)
         proprio_feature = self.proprio_projector(proprio_embed)
-        return self.fusion_norm(torch.cat([visual_feature, proprio_feature], dim=-1))
+        return self.fusion_proj(torch.cat([visual_feature, proprio_feature], dim=-1))
+
+    def forward(self, vision: torch.Tensor, proprio_embed: torch.Tensor) -> torch.Tensor:
+        return self.fuse_feature_map(self.encode_images(vision), proprio_embed)
 
 
 class MambaPolicy(_PointCloudMambaPolicy):
@@ -189,7 +186,7 @@ class MambaPolicy(_PointCloudMambaPolicy):
         pretrained_backbone: bool | None = None,
         freeze_backbone: bool | None = None,
         backbone_weights: str | Path | None = None,
-        dinov3_image_hw: Sequence[int] = DINOV3_IMAGE_HW,
+        image_hw: tuple[int, int] = RESNET18_IMAGE_HW,
     ):
         if list(camera_names) != ["head_camera"]:
             raise ValueError(
@@ -227,7 +224,7 @@ class MambaPolicy(_PointCloudMambaPolicy):
             pretrained=pretrained_backbone,
             freeze_backbone=freeze_backbone,
             backbone_weights=backbone_weights,
-            image_hw=dinov3_image_hw,
+            image_hw=image_hw,
         )
 
     def compute_loss_at_indices(

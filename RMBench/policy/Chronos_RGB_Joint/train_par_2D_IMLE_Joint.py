@@ -1,10 +1,9 @@
-"""Train DINOv3 RGB Chronos on native 14-D RMBench joint trajectories."""
+"""Train official-ResNet RGB Chronos on native 14-D RMBench joint data."""
 
 from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import os
 import tempfile
@@ -23,14 +22,18 @@ try:
     from .best_ema_checkpoint import BestEMADeployCheckpoint
     from .M_dataset_robotwinRGB_J import (
         RGBJointTrajectoryDataset,
+        build_episode_manifest,
         discover_episode_files,
+        episode_manifest_fingerprint,
         make_joint_scaler,
         parallel_collate_fn_rgb_joint,
     )
-    from .dinov3_backbone import (
-        DINOV3_IMAGE_HW,
-        DINOV3_MODEL_NAME,
+    from .resnet18_backbone import (
+        RESNET18_IMAGE_HW,
+        RESNET18_MODEL_NAME,
+        RESNET18_WEIGHTS_SHA256,
         configure_float32_numerics,
+        verify_resnet18_weights,
     )
     from .contracts import base_policy_contract
     from .mamba_policy_par_2D_IMLE_Joint import MambaConfig, MambaPolicy
@@ -40,14 +43,18 @@ except ImportError:  # direct script execution
     from best_ema_checkpoint import BestEMADeployCheckpoint
     from M_dataset_robotwinRGB_J import (
         RGBJointTrajectoryDataset,
+        build_episode_manifest,
         discover_episode_files,
+        episode_manifest_fingerprint,
         make_joint_scaler,
         parallel_collate_fn_rgb_joint,
     )
-    from dinov3_backbone import (
-        DINOV3_IMAGE_HW,
-        DINOV3_MODEL_NAME,
+    from resnet18_backbone import (
+        RESNET18_IMAGE_HW,
+        RESNET18_MODEL_NAME,
+        RESNET18_WEIGHTS_SHA256,
         configure_float32_numerics,
+        verify_resnet18_weights,
     )
     from contracts import base_policy_contract
     from mamba_policy_par_2D_IMLE_Joint import MambaConfig, MambaPolicy
@@ -77,7 +84,7 @@ class CadencedResumeCheckpoint(ModelCheckpoint):
 
 
 class LitMambaRGBJoint(pl.LightningModule):
-    """Lightning wrapper for raw RGB or fingerprinted DINOv3 feature caches."""
+    """Lightning wrapper for the released raw-RGB ResNet-18 path."""
 
     def __init__(
         self,
@@ -87,7 +94,7 @@ class LitMambaRGBJoint(pl.LightningModule):
         weight_decay: float = 1e-4,
         warmup_epochs: int = 15,
         eta_min: float = 2e-5,
-        vision_chunk_size: int = 32,
+        vision_chunk_size: int = 256,
         supervision_frames: int = 0,
         validation_seed: int = 42,
         pretrained_backbone: bool = True,
@@ -127,7 +134,7 @@ class LitMambaRGBJoint(pl.LightningModule):
             pretrained_backbone=pretrained_backbone,
             freeze_backbone=freeze_backbone,
             backbone_weights=backbone_weights,
-            dinov3_image_hw=DINOV3_IMAGE_HW,
+            image_hw=RESNET18_IMAGE_HW,
         )
         self.save_hyperparameters(
             {
@@ -140,9 +147,9 @@ class LitMambaRGBJoint(pl.LightningModule):
                 "validation_seed": self.validation_seed,
                 "pretrained_backbone": bool(pretrained_backbone),
                 "freeze_backbone": bool(freeze_backbone),
-                "backbone_name": DINOV3_MODEL_NAME,
-                "dinov3_image_hw": list(DINOV3_IMAGE_HW),
-                "policy_variant": "chronos_rgb_joint14_dinov3b",
+                "backbone_name": RESNET18_MODEL_NAME,
+                "image_hw": list(RESNET18_IMAGE_HW),
+                "policy_variant": "chronos_rgb_joint14_resnet18",
                 "backbone_weights_sha256": backbone_weights_sha256,
                 "run_contract": self.run_contract,
                 "camera_names": list(config.camera_names),
@@ -158,8 +165,8 @@ class LitMambaRGBJoint(pl.LightningModule):
     def transfer_batch_to_device(
         self, batch: Dict[str, Any], device: torch.device, dataloader_idx: int
     ) -> Dict[str, Any]:
-        # Keep full raw RGB or float32 cached tokens on CPU and move only a
-        # bounded frame chunk inside _compute_vision_features.
+        # Keep full normalized RGB on CPU and move only a bounded frame chunk
+        # inside _compute_vision_features, exactly as the real-world trainer.
         transferred = dict(batch)
         for key in ("obs", "actions", "mask", "episode_index", "lengths"):
             if key in transferred and torch.is_tensor(transferred[key]):
@@ -169,76 +176,71 @@ class LitMambaRGBJoint(pl.LightningModule):
     def _compute_vision_features(
         self, vision: torch.Tensor, obs: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
-        raw_images = vision.ndim == 5
-        cached_tokens = vision.ndim == 4
-        if raw_images and vision.shape[2] != 3:
-            raise ValueError(f"Expected RGB [B,L,3,H,W], got {tuple(vision.shape)}")
-        if not raw_images and not cached_tokens:
+        if vision.ndim != 5 or tuple(vision.shape[2:]) != (
+            3,
+            *RESNET18_IMAGE_HW,
+        ):
             raise ValueError(
-                "Expected raw RGB [B,L,3,H,W] or cached tokens [B,L,21,768], "
-                f"got {tuple(vision.shape)}"
+                "Expected normalized official RGB [B,L,3,480,640], got "
+                f"{tuple(vision.shape)}"
+            )
+        if vision.dtype != torch.float32 or vision.device.type != "cpu":
+            raise TypeError(
+                "Full RGB trajectories must remain CPU float32 until chunk transfer; "
+                f"got dtype={vision.dtype}, device={vision.device}"
             )
         batch_size, sequence_length = obs.shape[:2]
-        flat_valid = (~mask).reshape(-1)
-        valid_indices = flat_valid.nonzero(as_tuple=False).squeeze(-1)
-        if valid_indices.numel() == 0:
-            raise ValueError("Batch contains no valid trajectory frames")
-
-        flat_obs = obs.reshape(-1, obs.shape[-1])
-        valid_obs = flat_obs.index_select(0, valid_indices)
-        flat_vision = vision.reshape(-1, *vision.shape[2:])
-        # Vision data deliberately remains CPU, so use CPU selection indices.
-        valid_vision = flat_vision.index_select(0, valid_indices.detach().cpu())
-
-        feature_chunks = []
-        for start in range(0, valid_indices.numel(), self.vision_chunk_size):
-            end = min(start + self.vision_chunk_size, valid_indices.numel())
-            vision_chunk = valid_vision[start:end].to(self.device, non_blocking=True)
-            proprio_chunk = valid_obs[start:end]
-            # For online raw RGB with a frozen backbone, compute DINOv3 once.
-            # Checkpointing the whole fusion module would needlessly run the
-            # 86M backbone again during backward.
-            if raw_images and self.policy.fusion_engine.image_encoder.freeze:
-                vision_chunk = self.policy.fusion_engine.image_encoder(vision_chunk)
-            if self.training and torch.is_grad_enabled():
-                # The cache removes frozen-DINO compute; checkpoint only the
-                # small trainable adapter over each full-trajectory chunk.
-                feature = checkpoint(
-                    self.policy.fusion_engine,
-                    vision_chunk,
-                    proprio_chunk,
-                    use_reentrant=False,
+        lengths = (~mask).sum(dim=1)
+        fusion = self.policy.fusion_engine
+        sequences = []
+        for batch_index, length_tensor in enumerate(lengths):
+            length = int(length_tensor.item())
+            if length <= 0:
+                raise ValueError("Batch contains an empty trajectory")
+            chunks = []
+            for start in range(0, length, self.vision_chunk_size):
+                end = min(start + self.vision_chunk_size, length)
+                image_chunk = vision[batch_index, start:end].contiguous().to(
+                    self.device, dtype=torch.float32, non_blocking=False
                 )
-            else:
-                feature = self.policy.fusion_engine(vision_chunk, proprio_chunk)
-            feature_chunks.append(feature)
-        valid_features = torch.cat(feature_chunks, dim=0)
-
-        flat_features = torch.zeros(
-            batch_size * sequence_length,
-            self.config.embed_dim,
-            device=self.device,
-            dtype=valid_features.dtype,
-        )
-        # Out-of-place index_copy preserves gradients into visual/proprio heads.
-        flat_features = flat_features.index_copy(0, valid_indices, valid_features)
-        return flat_features.view(batch_size, sequence_length, self.config.embed_dim)
+                proprio_chunk = obs[batch_index, start:end].contiguous()
+                # Never checkpoint or rerun the frozen ResNet trunk. Only the
+                # released trainable adapter is recomputed during backward.
+                feature_map = fusion.encode_images(image_chunk)
+                if self.training and torch.is_grad_enabled():
+                    feature = checkpoint(
+                        fusion.fuse_feature_map,
+                        feature_map,
+                        proprio_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    feature = fusion.fuse_feature_map(feature_map, proprio_chunk)
+                chunks.append(feature)
+            sequence = torch.cat(chunks, dim=0)
+            if length < sequence_length:
+                sequence = torch.cat(
+                    [
+                        sequence,
+                        sequence.new_zeros(
+                            sequence_length - length, self.config.embed_dim
+                        ),
+                    ],
+                    dim=0,
+                )
+            sequences.append(sequence)
+        return torch.stack(sequences, dim=0)
 
     def _supervision_indices(
         self, lengths: torch.Tensor, stage: str, device: torch.device
     ) -> torch.Tensor:
         shortest_episode = int(lengths.min().item())
-        if self.supervision_frames == 0 and not torch.all(lengths == lengths[0]):
-            raise ValueError(
-                "--supervision-frames 0 means every valid timestep and therefore requires "
-                "--batch-size 1 for variable-length episodes. Use a fixed positive "
-                "supervision count if batching multiple episodes."
-            )
-        num_frames = (
-            shortest_episode
-            if self.supervision_frames == 0
-            else min(self.supervision_frames, shortest_episode)
-        )
+        if self.supervision_frames == 0:
+            # Match the released batch-size-2 trainer: supervise the padded
+            # rectangular sequence and remove padding with the dataset mask.
+            max_length = int(lengths.max().item())
+            return torch.arange(max_length, device=device).expand(len(lengths), -1)
+        num_frames = min(self.supervision_frames, shortest_episode)
         rows = []
         for length_tensor in lengths:
             length = int(length_tensor.item())
@@ -268,8 +270,9 @@ class LitMambaRGBJoint(pl.LightningModule):
         obs = batch["obs"]
         actions = batch["actions"]
         mask = batch["mask"]
-        vision_key = "image_features" if "image_features" in batch else "image"
-        fused = self._compute_vision_features(batch[vision_key], obs, mask)
+        if "image" not in batch:
+            raise ValueError("Official ResNet training requires normalized RGB images")
+        fused = self._compute_vision_features(batch["image"], obs, mask)
         indices = self._supervision_indices(batch["lengths"], stage, obs.device)
         if stage == "val":
             # IMLE mode selection, bridge time and bridge noise are stochastic.
@@ -291,7 +294,10 @@ class LitMambaRGBJoint(pl.LightningModule):
                 per_frame_loss = self.policy.compute_loss_at_indices(fused, actions, indices)
         else:
             per_frame_loss = self.policy.compute_loss_at_indices(fused, actions, indices)
-        loss = per_frame_loss.mean()
+        selected_valid = (~mask).gather(1, indices)
+        if not selected_valid.any():
+            raise ValueError("No valid supervised trajectory frame")
+        loss = (per_frame_loss * selected_valid).sum() / selected_valid.sum()
         self.log(
             f"{stage}_loss",
             loss,
@@ -360,14 +366,6 @@ def _parse_devices(value: str) -> Any:
     if "," in value:
         return [int(part) for part in value.split(",")]
     return value
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _resolve_resume(value: str, output_dir: Path) -> str | None:
@@ -477,7 +475,10 @@ def _validate_resume_checkpoint(
 def build_arg_parser() -> argparse.ArgumentParser:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Train DINOv3 Chronos with RMBench RGB and native 14-D joint actions"
+        description=(
+            "Train Chronos with the official real-world ResNet-18 RGB encoder "
+            "and native RMBench 14-D joint actions"
+        )
     )
     parser.add_argument("--data-root", required=True, help="RMBench .../demo_clean/data")
     parser.add_argument(
@@ -500,14 +501,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scaler-path", default=str(here / "scaler_cover_blocks_joint_rgb.pth"))
     parser.add_argument(
-        "--feature-root",
-        default=None,
-        help="Optional external [T,21,768] frozen-DINOv3 cache directory",
-    )
-    parser.add_argument(
         "--backbone-weights",
-        default=None,
-        help="External DINOv3-B/16 .safetensors/.pth (never commit this file)",
+        default=str(
+            Path.home()
+            / ".cache"
+            / "torch"
+            / "hub"
+            / "checkpoints"
+            / "resnet18-f37072fd.pth"
+        ),
+        help="Official torchvision ResNet-18 state dict (verified by SHA-256)",
     )
     parser.add_argument("--refit-scaler", action="store_true")
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -515,9 +518,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-height", type=int, default=240)
     parser.add_argument("--image-width", type=int, default=320)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--vision-chunk-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--vision-chunk-size", type=int, default=256)
     parser.add_argument(
         "--supervision-frames",
         type=int,
@@ -559,8 +562,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the released Chronos warmup EMA (enabled by default)",
     )
-    parser.add_argument("--no-pretrained-backbone", action="store_true")
-    parser.add_argument("--train-backbone", action="store_true")
     parser.add_argument(
         "--resume",
         default="auto",
@@ -599,31 +600,15 @@ def main(argv=None) -> None:
         )
     if args.periodic_every_n_epochs < 0:
         raise ValueError("--periodic-every-n-epochs must be non-negative")
-    if args.feature_root is not None and args.train_backbone:
-        raise ValueError("A frozen feature cache cannot be used with --train-backbone")
-    if args.feature_root is None and not args.no_pretrained_backbone:
-        raise ValueError(
-            "Formal pretrained RGB-Joint training requires --feature-root so the exact "
-            "DINOv3 preprocessing/data fingerprint is bound into the checkpoint. "
-            "The raw path is reserved for explicit random-backbone diagnostics."
-        )
     if args.refit_scaler and resume is not None:
         raise ValueError(
             "--refit-scaler cannot be combined with resume. Use --resume none and a "
             "new run, or keep the checkpoint's verified scaler."
         )
-    backbone_weights: Path | None = None
-    backbone_sha256: str | None = None
-    if args.backbone_weights is not None:
-        backbone_weights = Path(args.backbone_weights).expanduser().resolve()
-        if not backbone_weights.is_file():
-            raise FileNotFoundError(f"DINOv3 weights do not exist: {backbone_weights}")
-        backbone_sha256 = _sha256_file(backbone_weights)
-    elif not args.no_pretrained_backbone:
-        raise ValueError(
-            "Pretrained DINOv3 is gated. Pass --backbone-weights with an external "
-            "authorized file, or explicitly use --no-pretrained-backbone only for tests."
-        )
+    backbone_weights = Path(args.backbone_weights).expanduser().resolve()
+    backbone_sha256 = verify_resnet18_weights(backbone_weights)
+    if backbone_sha256 != RESNET18_WEIGHTS_SHA256:
+        raise RuntimeError("Official ResNet-18 weight verification returned an invalid SHA")
     all_episode_files = discover_episode_files(args.data_root, mode="all")
     if args.expected_episodes and len(all_episode_files) != args.expected_episodes:
         raise RuntimeError(
@@ -638,7 +623,6 @@ def main(argv=None) -> None:
         "image_hw": (args.image_height, args.image_width),
         "val_fraction": args.val_fraction,
         "split_seed": args.split_seed,
-        "feature_root": args.feature_root,
     }
     train_dataset = RGBJointTrajectoryDataset(mode="train", scaler=None, **split_kwargs)
     # Fitting 45 small joint arrays is cheap.  Always recompute the expected
@@ -666,27 +650,13 @@ def main(argv=None) -> None:
     train_dataset.scaler = scaler
     val_dataset = RGBJointTrajectoryDataset(mode="val", scaler=scaler, **split_kwargs)
 
-    cache_contract_sha256: str | None = None
-    cache_dataset_sha256: str | None = None
-    if train_dataset.feature_metadata is not None:
-        cache_sha256 = train_dataset.feature_metadata["weights_sha256"]
-        if backbone_sha256 != cache_sha256:
-            raise RuntimeError(
-                "DINOv3 cache/backbone mismatch: "
-                f"cache={cache_sha256}, weights={backbone_sha256}"
-            )
-        cache_contract_sha256 = str(
-            train_dataset.feature_metadata["cache_contract_sha256"]
-        )
-        cache_dataset_sha256 = str(
-            train_dataset.feature_metadata["cache_dataset_sha256"]
-        )
+    dataset_manifest = build_episode_manifest(all_episode_files)
+    dataset_fingerprint = episode_manifest_fingerprint(dataset_manifest)
 
     run_contract: dict[str, object] = {
         "backbone_weights_sha256": backbone_sha256,
         "scaler_fingerprint": scaler.fingerprint(),
-        "cache_contract_sha256": cache_contract_sha256,
-        "cache_dataset_sha256": cache_dataset_sha256,
+        "dataset_manifest_sha256": dataset_fingerprint,
         "split_seed": args.split_seed,
         "val_fraction": args.val_fraction,
         "train_episodes": [path.name for path in train_dataset.file_paths],
@@ -717,14 +687,14 @@ def main(argv=None) -> None:
             "ema_max_decay": None if args.no_ema else 0.9999,
             "ema_update_timing": "every_training_batch_matching_released_chronos",
             "overfit_batches": args.overfit_batches,
-            "pretrained_backbone": not args.no_pretrained_backbone,
-            "freeze_backbone": not args.train_backbone,
+            "pretrained_backbone": True,
+            "freeze_backbone": True,
             "accelerator": args.accelerator,
             "devices": args.devices,
             "deterministic_trainer": False,
             "float32_matmul_precision": "highest",
             "cuda_matmul_allow_tf32": False,
-            "cudnn_allow_tf32": False,
+            "cudnn_allow_tf32": True,
         },
     }
     expected_policy_contract = {**base_policy_contract(), **run_contract}
@@ -741,10 +711,8 @@ def main(argv=None) -> None:
     manifest = {
         "data_root": str(Path(args.data_root).expanduser().resolve()),
         "expected_episodes": args.expected_episodes,
+        "episodes": dataset_manifest,
         "policy_contract": expected_policy_contract,
-        "feature_root": None
-        if args.feature_root is None
-        else str(Path(args.feature_root).expanduser().resolve()),
     }
     manifest_path = output_dir / "split_manifest.json"
     temporary_manifest = manifest_path.with_suffix(".json.partial")
@@ -757,7 +725,10 @@ def main(argv=None) -> None:
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
-        "pin_memory": torch.cuda.is_available(),
+        # One batch can contain several GiB of 480x640 FP32 frames. Pinning the
+        # whole trajectory is neither used by the official chunk pipeline nor
+        # safe for the host's locked-memory budget.
+        "pin_memory": False,
         "persistent_workers": args.num_workers > 0,
         "collate_fn": parallel_collate_fn_rgb_joint,
     }
@@ -775,8 +746,8 @@ def main(argv=None) -> None:
         vision_chunk_size=args.vision_chunk_size,
         supervision_frames=args.supervision_frames,
         validation_seed=args.validation_seed,
-        pretrained_backbone=not args.no_pretrained_backbone,
-        freeze_backbone=not args.train_backbone,
+        pretrained_backbone=True,
+        freeze_backbone=True,
         backbone_weights=backbone_weights,
         backbone_weights_sha256=backbone_sha256,
         run_contract=run_contract,
@@ -820,7 +791,7 @@ def main(argv=None) -> None:
         )
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
     logger = TensorBoardLogger(
-        save_dir=output_dir.parent.parent, name=f"{args.task_name}_rgb_joint_dinov3"
+        save_dir=output_dir.parent.parent, name=f"{args.task_name}_rgb_joint_resnet18"
     )
     trainer = pl.Trainer(
         accelerator=args.accelerator,
@@ -834,6 +805,10 @@ def main(argv=None) -> None:
         log_every_n_steps=1,
         deterministic=False,
         overfit_batches=args.overfit_batches,
+        # The full real-batch preflight is performed before launch. Skipping
+        # Lightning's two expensive validation sanity batches makes epoch 0
+        # visibly begin immediately and does not change training/validation.
+        num_sanity_val_steps=0,
     )
 
     print(

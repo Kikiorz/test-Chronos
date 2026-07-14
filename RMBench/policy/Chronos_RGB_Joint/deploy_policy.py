@@ -1,7 +1,11 @@
-"""RoboTwin/RMBench adapter for DINOv3 RGB plus native joint Chronos.
+"""RoboTwin/RMBench adapter for ResNet-18 RGB plus native joint Chronos.
 
 The joint vector is the 14-D drive-target state saved by RMBench, ordered as
 left six joints, left gripper, right six joints, right gripper.
+
+RoboTwin already exposes the head-camera frame as RGB.  This adapter keeps the
+native uint8 frame untouched; the controller applies the official real-world
+resize and ImageNet normalization exactly once, immediately before inference.
 """
 
 from __future__ import annotations
@@ -11,9 +15,9 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from .dinov3_backbone import RMBENCH_RGB_HW
 from .contracts import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES, RMBENCH_EMBODIMENT
 from .mamba_controller_rgb_joint import MambaRGBJointController
+from .resnet18_backbone import RMBENCH_RGB_HW
 
 
 def _extract_head_rgb(observation: Mapping[str, Any], camera_name: str) -> np.ndarray:
@@ -30,42 +34,19 @@ def _extract_head_rgb(observation: Mapping[str, Any], camera_name: str) -> np.nd
         )
 
     image = np.asarray(camera["rgb"])
-    if image.ndim != 3 or image.shape[-1] not in (3, 4):
+    expected_shape = (*RMBENCH_RGB_HW, 3)
+    if image.shape != expected_shape:
         raise ValueError(
-            f"Expected {camera_name} RGB in HWC layout with 3 or 4 channels, got {image.shape}"
+            f"Expected native {camera_name} RGB uint8 HWC frame with shape "
+            f"{expected_shape}, got {image.shape}"
         )
-    image = image[..., :3]
-    if not np.issubdtype(image.dtype, np.number):
-        raise TypeError(f"RGB image must be numeric, got dtype={image.dtype}")
-
-    if tuple(image.shape[:2]) != RMBENCH_RGB_HW:
-        raise ValueError(
-            f"Expected native RMBench RGB size {RMBENCH_RGB_HW}, got {image.shape[:2]}"
+    if image.dtype != np.uint8:
+        raise TypeError(
+            f"Native RMBench RGB must be uint8 so its scale is unambiguous, got {image.dtype}"
         )
-    # SAPIEN/RoboTwin already returns RGB (not OpenCV BGR), so there is no
-    # red/blue channel swap here.  Preserve dtype information: an extremely
-    # dark uint8 frame with max 0 or 1 still needs division by 255.
-    integer_input = np.issubdtype(image.dtype, np.integer)
-    image = image.astype(np.float32, copy=False)
-    if not np.isfinite(image).all():
-        raise ValueError("RGB image contains NaN or infinity")
-    minimum = float(image.min()) if image.size else 0.0
-    maximum = float(image.max()) if image.size else 0.0
-    if minimum < 0.0 or maximum > 255.0:
-        raise ValueError("RGB values must lie in [0,255]")
-    if not integer_input and 1.0 < maximum <= 1.5:
-        raise ValueError(
-            "Float RGB has ambiguous scale: expected [0,1] or an unambiguous [0,255] frame"
-        )
-    if integer_input or maximum > 1.5:
-        # Multiplication by the rounded float32 reciprocal is bit-identical to
-        # CUDA's uint8.float().div(255) for every possible byte value.  NumPy's
-        # direct float32 division differs by one ULP for some values, which is
-        # then amplified by bicubic resize and DINOv3.
-        image = image * np.float32(1.0 / 255.0)
-    if image.size and (float(image.min()) < 0.0 or float(image.max()) > 1.0):
-        raise ValueError("RGB scaling did not produce values in [0,1]")
-    return image
+    # No BGR swap and no /255 or ImageNet normalization here.  Copying into a
+    # contiguous array prevents later mutation of the environment-owned frame.
+    return np.ascontiguousarray(image).copy()
 
 
 def _extract_joint_state(observation: Mapping[str, Any]) -> np.ndarray:
@@ -89,7 +70,7 @@ def encode_obs(observation: Mapping[str, Any], camera_name: str = "head_camera")
     qpos = _extract_joint_state(observation)
     image_tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1))).unsqueeze(0)
     qpos_tensor = torch.from_numpy(qpos).unsqueeze(0)
-    return {"image": image_tensor.float(), "qpos": qpos_tensor.float()}
+    return {"image": image_tensor, "qpos": qpos_tensor.float()}
 
 
 def get_model(usr_args: Mapping[str, Any]) -> MambaRGBJointController:

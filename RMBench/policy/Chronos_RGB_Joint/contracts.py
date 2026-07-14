@@ -3,39 +3,31 @@
 from __future__ import annotations
 
 try:
-    from .dinov3_backbone import (
-        DINOV3_IMAGE_HW,
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_MODEL_NAME,
-        DINOV3_NORMALIZATION_MEAN,
-        DINOV3_NORMALIZATION_STD,
-        DINOV3_RESIZE_MODE,
-        DINOV3_RGB_SCALE,
-        DINOV3_PATCH_SIZE,
-        DINOV3_POOL_HW,
+    from .resnet18_backbone import (
         FLOAT32_NUMERICS,
+        RESNET18_IMAGE_HW,
+        RESNET18_MODEL_NAME,
+        RESNET18_NORMALIZATION_MEAN,
+        RESNET18_NORMALIZATION_STD,
+        RESNET18_RESIZE_MODE,
+        RESNET18_WEIGHTS_SHA256,
         RMBENCH_RGB_HW,
     )
 except ImportError:  # direct script execution
-    from dinov3_backbone import (  # type: ignore
-        DINOV3_IMAGE_HW,
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_MODEL_NAME,
-        DINOV3_NORMALIZATION_MEAN,
-        DINOV3_NORMALIZATION_STD,
-        DINOV3_RESIZE_MODE,
-        DINOV3_RGB_SCALE,
-        DINOV3_PATCH_SIZE,
-        DINOV3_POOL_HW,
+    from resnet18_backbone import (  # type: ignore
         FLOAT32_NUMERICS,
+        RESNET18_IMAGE_HW,
+        RESNET18_MODEL_NAME,
+        RESNET18_NORMALIZATION_MEAN,
+        RESNET18_NORMALIZATION_STD,
+        RESNET18_RESIZE_MODE,
+        RESNET18_WEIGHTS_SHA256,
         RMBENCH_RGB_HW,
     )
 
 
-POLICY_VARIANT = "chronos_rgb_joint14_dinov3b"
-POLICY_CONTRACT_VERSION = 5
+POLICY_VARIANT = "chronos_rgb_joint14_resnet18"
+POLICY_CONTRACT_VERSION = 6
 CAMERA_NAME = "head_camera"
 TARGET_OFFSET = 1
 INFERENCE_SAMPLE_STEPS = 5
@@ -51,7 +43,12 @@ JOINT_ORDER = (
 
 
 def base_policy_contract() -> dict[str, object]:
-    """Return a fresh JSON-serializable static policy contract."""
+    """Return the immutable, JSON-serializable policy contract.
+
+    The modality-specific path mirrors the released real-world image policy;
+    the action semantics and temporal objective mirror the released RMBench
+    policy because the demonstrations and evaluator are RMBench joint data.
+    """
 
     return {
         "contract_version": POLICY_CONTRACT_VERSION,
@@ -67,32 +64,40 @@ def base_policy_contract() -> dict[str, object]:
         "future_steps": 16,
         "target_offset": TARGET_OFFSET,
         "action_type": "qpos",
-        "backbone": DINOV3_MODEL_NAME,
+        "backbone": RESNET18_MODEL_NAME,
+        "backbone_reference_weights_sha256": RESNET18_WEIGHTS_SHA256,
         "source_image_hw": list(RMBENCH_RGB_HW),
-        "image_hw": list(DINOV3_IMAGE_HW),
+        "image_hw": list(RESNET18_IMAGE_HW),
         "image_preprocess": {
             "channel_order": "RGB",
-            "input_scale": DINOV3_RGB_SCALE,
-            "resize": {"mode": DINOV3_RESIZE_MODE, "antialias": True},
-            "normalization_mean": list(DINOV3_NORMALIZATION_MEAN),
-            "normalization_std": list(DINOV3_NORMALIZATION_STD),
-        },
-        "vision_token_layout": {
-            "patch_size": DINOV3_PATCH_SIZE,
-            "feature_dim": DINOV3_FEATURE_DIM,
-            "pool_hw": list(DINOV3_POOL_HW),
-            "cache_tokens": DINOV3_CACHE_TOKENS,
-            "token_order": "CLS_then_adaptive_avg_pool_row_major_height_width",
+            "input_dtype": "uint8",
+            "input_scale": "divide_by_255_float32",
+            "resize": {
+                "library": "opencv",
+                "mode": RESNET18_RESIZE_MODE,
+                "output_wh": [RESNET18_IMAGE_HW[1], RESNET18_IMAGE_HW[0]],
+            },
+            "normalization_mean": list(RESNET18_NORMALIZATION_MEAN),
+            "normalization_std": list(RESNET18_NORMALIZATION_STD),
+            "output_layout": "CHW_float32",
         },
         "architecture": {
             "history_model": "released_Chronos_Mamba",
             "embed_dim": 1024,
             "d_model": 1024,
             "num_blocks": 6,
-            "visual_global_adapter_dim": 128,
-            "visual_spatial_adapter_dim": 384,
-            "proprio_adapter_dim": 512,
-            "fusion_dim": 1024,
+            "vision_trunk": (
+                "torchvision_resnet18_without_avgpool_fc_then_all_batchnorm2d_"
+                "replaced_by_fresh_groupnorm32"
+            ),
+            "vision_trunk_output": [512, 15, 20],
+            "vision_trunk_frozen": True,
+            "visual_adapter": (
+                "conv3x3_512_256_gn32_silu_conv3x3s2_256_128_gn16_silu_"
+                "flatten_linear10240_1024_ln_silu_dropout0.10"
+            ),
+            "proprio_adapter": "linear14_128_relu_linear128_512_ln",
+            "fusion": "linear1536_1024_ln",
             "action_head": "released_IMLE_plus_symplectic_bridge",
         },
         "training_objective": {
@@ -110,8 +115,8 @@ def base_policy_contract() -> dict[str, object]:
         "normalization": {
             "type": "per_key_zscore",
             "fit_split": "train_only",
-            "std_unbiased": False,
-            "std_epsilon": 1e-6,
+            "std_unbiased": True,
+            "std_epsilon": 1e-8,
             "action_statistics": "independent_per_joint_per_horizon",
             "first_action_target": "next_recorded_drive_target_t_plus_1",
             "denormalize_before_temporal_aggregation": True,

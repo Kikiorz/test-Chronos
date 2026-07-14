@@ -4,6 +4,11 @@ RMBench writes each RGB frame as a fixed-width JPEG byte string.  Its writer
 passes the simulator's RGB array directly to OpenCV; consequently OpenCV decode
 already returns the original numeric RGB channel order.  Do *not* apply an
 additional BGR->RGB swap for these files.
+
+Every decoded frame follows the released Chronos real-world visual path:
+OpenCV INTER_AREA resize from 240x320 to 480x640, conversion to float32 in
+[0,1], ImageNet normalization, and CHW layout.  There is intentionally no
+alternate cached-feature or DINOv3 path in this formal dataset.
 """
 
 from __future__ import annotations
@@ -24,48 +29,20 @@ from torch.utils.data import Dataset
 try:
     from .scaler_M import Scaler
     from .contracts import JOINT_ORDER, TARGET_OFFSET
-    from .dinov3_backbone import (
-        DINOV3_CACHE_AMP_DTYPE,
-        DINOV3_CACHE_BATCH_IMAGES,
-        DINOV3_CACHE_DTYPE,
-        DINOV3_CACHE_DEVICE_TYPE,
-        DINOV3_CACHE_FORMAT_VERSION,
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_IMAGE_HW,
-        DINOV3_MODEL_NAME,
-        DINOV3_NORMALIZATION_MEAN,
-        DINOV3_NORMALIZATION_STD,
-        DINOV3_PATCH_SIZE,
-        DINOV3_POOL_HW,
-        DINOV3_RGB_SCALE,
-        DINOV3_RESIZE_MODE,
-        FLOAT32_NUMERICS,
+    from .resnet18_backbone import (
         RMBENCH_RGB_HW,
-        dinov3_cache_contract,
+        RESNET18_IMAGE_HW,
+        RESNET18_RESIZE_MODE,
+        preprocess_rgb_numpy,
     )
 except ImportError:  # direct script execution
     from scaler_M import Scaler
     from contracts import JOINT_ORDER, TARGET_OFFSET  # type: ignore
-    from dinov3_backbone import (  # type: ignore
-        DINOV3_CACHE_AMP_DTYPE,
-        DINOV3_CACHE_BATCH_IMAGES,
-        DINOV3_CACHE_DTYPE,
-        DINOV3_CACHE_DEVICE_TYPE,
-        DINOV3_CACHE_FORMAT_VERSION,
-        DINOV3_CACHE_TOKENS,
-        DINOV3_FEATURE_DIM,
-        DINOV3_IMAGE_HW,
-        DINOV3_MODEL_NAME,
-        DINOV3_NORMALIZATION_MEAN,
-        DINOV3_NORMALIZATION_STD,
-        DINOV3_PATCH_SIZE,
-        DINOV3_POOL_HW,
-        DINOV3_RGB_SCALE,
-        DINOV3_RESIZE_MODE,
-        FLOAT32_NUMERICS,
+    from resnet18_backbone import (  # type: ignore
         RMBENCH_RGB_HW,
-        dinov3_cache_contract,
+        RESNET18_IMAGE_HW,
+        RESNET18_RESIZE_MODE,
+        preprocess_rgb_numpy,
     )
 
 
@@ -185,6 +162,67 @@ def discover_episode_files(
     return [path for index, path in enumerate(flat_files) if index in val_indices]
 
 
+def build_episode_manifest(
+    paths: Sequence[str | Path],
+) -> Dict[str, Dict[str, object]]:
+    """Build a deterministic, location-independent source episode manifest.
+
+    The file name is both the stable key and an explicit field.  Duplicate
+    names are rejected because they could otherwise make a run contract
+    ambiguous after the dataset is moved to a different machine.
+    """
+
+    file_paths = [Path(path).expanduser().resolve() for path in paths]
+    ordered_paths = sorted(file_paths, key=_natural_episode_key)
+    names = [path.name for path in ordered_paths]
+    if len(names) != len(set(names)):
+        raise ValueError("Episode manifest requires unique HDF5 file names")
+
+    manifest: Dict[str, Dict[str, object]] = {}
+    for path in ordered_paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Episode source does not exist: {path}")
+        with h5py.File(path, "r") as root:
+            image_key = "observation/head_camera/rgb"
+            if "joint_action/vector" not in root or image_key not in root:
+                raise KeyError(
+                    f"{path.name} lacks 'joint_action/vector' or {image_key!r}"
+                )
+            frames = int(len(root["joint_action/vector"]))
+            if len(root[image_key]) != frames:
+                raise ValueError(
+                    f"{path.name} RGB/joint length mismatch: "
+                    f"rgb={len(root[image_key])}, joint={frames}"
+                )
+        stat_before = path.stat()
+        source_sha256 = _sha256_file(path)
+        stat_after = path.stat()
+        if (
+            stat_before.st_size != stat_after.st_size
+            or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+        ):
+            raise RuntimeError(f"Episode changed while it was being hashed: {path}")
+        manifest[path.name] = {
+            "name": path.name,
+            "source_bytes": int(stat_after.st_size),
+            "source_sha256": source_sha256,
+            "frames": frames,
+        }
+    return manifest
+
+
+def episode_manifest_fingerprint(
+    paths_or_manifest: Sequence[str | Path] | Mapping[str, Mapping[str, object]],
+) -> str:
+    """Canonical SHA-256 of a source manifest, hashing episode files once."""
+
+    if isinstance(paths_or_manifest, Mapping):
+        manifest: object = paths_or_manifest
+    else:
+        manifest = build_episode_manifest(paths_or_manifest)
+    return _json_sha256(manifest)
+
+
 def _as_column(array: np.ndarray) -> np.ndarray:
     array = np.asarray(array, dtype=np.float32)
     if array.ndim == 1:
@@ -209,18 +247,17 @@ def _decode_robotwin_rgb(value: object) -> np.ndarray:
         if image is None:
             raise ValueError("cv2.imdecode failed for an RMBench uint8 JPEG frame")
         return image
-    if array.ndim == 3 and array.shape[-1] in (3, 4):
-        return np.asarray(array[..., :3], dtype=np.uint8)
+    if array.ndim == 3 and array.shape[-1] == 3 and array.dtype == np.uint8:
+        return np.ascontiguousarray(array)
     raise TypeError(f"Unsupported RGB frame encoding: dtype={array.dtype}, shape={array.shape}")
 
 
 class RGBJointTrajectoryDataset(Dataset):
     """One HDF5 episode with 14-D joint state and future joint targets.
 
-    Without a feature cache, returns ``image`` as uint8 RGB ``[L,3,H,W]``.
-    With ``feature_root``, returns frozen DINOv3 tokens as float32
-    ``[L,21,768]`` and skips JPEG decoding.  The cache metadata is validated
-    against the online encoder contract before any training sample is used.
+    ``image`` is always official-real-world-preprocessed float32 RGB with shape
+    ``[L,3,480,640]``.  Keeping exactly one visual path prevents train/deploy
+    preprocessing drift.
     """
 
     def __init__(
@@ -229,13 +266,12 @@ class RGBJointTrajectoryDataset(Dataset):
         mode: str = "train",
         future_steps: int = 16,
         scaler: Optional[Scaler] = None,
-        image_hw: Sequence[int] = (240, 320),
+        image_hw: Sequence[int] = RMBENCH_RGB_HW,
         camera_name: str = "head_camera",
         val_fraction: float = 0.1,
         split_seed: int = 42,
         sequence_length: Optional[int] = None,
         random_window: Optional[bool] = None,
-        feature_root: str | Path | None = None,
     ):
         super().__init__()
         if future_steps != 16:
@@ -245,8 +281,8 @@ class RGBJointTrajectoryDataset(Dataset):
         if tuple(int(value) for value in image_hw) != RMBENCH_RGB_HW:
             raise ValueError(
                 "Chronos_RGB_Joint fixes the source RMBench RGB size at "
-                f"{RMBENCH_RGB_HW}; got {tuple(image_hw)}. Intermediate OpenCV resizing "
-                "would make raw RGB and cached DINOv3 paths inconsistent."
+                f"{RMBENCH_RGB_HW}; got {tuple(image_hw)}. The official real-world "
+                "preprocessing contract owns the only resize operation."
             )
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.mode = mode
@@ -263,99 +299,17 @@ class RGBJointTrajectoryDataset(Dataset):
         if self.sequence_length is not None and self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive, zero, or None")
         self.random_window = (mode.lower() == "train") if random_window is None else bool(random_window)
-        self.feature_root = (
-            None if feature_root is None else Path(feature_root).expanduser().resolve()
-        )
-        self.feature_metadata: dict[str, object] | None = None
-        if self.feature_root is not None:
-            metadata_path = self.feature_root / "metadata.json"
-            if not metadata_path.is_file():
-                raise FileNotFoundError(f"DINOv3 feature metadata is missing: {metadata_path}")
-            with metadata_path.open("r", encoding="utf-8") as stream:
-                metadata = json.load(stream)
-            weights_sha256 = metadata.get("weights_sha256")
-            if not isinstance(weights_sha256, str) or len(weights_sha256) != 64:
-                raise ValueError("Feature metadata must contain a 64-character weights_sha256")
-            expected = dinov3_cache_contract(self.camera_name, weights_sha256)
-            mismatches = {
-                key: (metadata.get(key), value)
-                for key, value in expected.items()
-                if metadata.get(key) != value
-            }
-            if mismatches:
-                raise ValueError(f"Incompatible DINOv3 feature cache: {mismatches}")
-            if metadata.get("cache_contract_sha256") != _json_sha256(expected):
-                raise ValueError(
-                    "DINOv3 cache contract fingerprint is missing or invalid; "
-                    "regenerate the cache instead of relabeling existing .npy files"
-                )
-            episodes_manifest = metadata.get("episodes")
-            if metadata.get("cache_dataset_sha256") != _json_sha256(episodes_manifest):
-                raise ValueError("DINOv3 cache episode-manifest fingerprint is invalid")
-            self.feature_metadata = metadata
         self.file_paths = discover_episode_files(
             self.root_dir, mode=mode, val_fraction=self.val_fraction, split_seed=self.split_seed
         )
         print(
             f"[{mode}] Chronos RGB Joint: {len(self.file_paths)} episodes | "
-            f"camera={camera_name} | raw_image_hw={self.image_hw} | "
-            f"dinov3_image_hw={DINOV3_IMAGE_HW} | "
+            f"camera={camera_name} | source_image_hw={self.image_hw} | "
+            f"resnet18_image_hw={RESNET18_IMAGE_HW} | "
+            f"resize={RESNET18_RESIZE_MODE} | "
             f"window={self.sequence_length or 'full'} | "
-            f"vision={'cached-dinov3' if self.feature_root else 'online-rgb'} | "
             f"root={self.root_dir}"
         )
-        if self.feature_root is not None:
-            missing_features = [
-                path.name for path in self.file_paths if not self._feature_path(path).is_file()
-            ]
-            if missing_features:
-                raise FileNotFoundError(
-                    f"Missing {len(missing_features)} DINOv3 feature files, "
-                    f"including {missing_features[:5]}"
-                )
-            assert self.feature_metadata is not None
-            episode_metadata = self.feature_metadata.get("episodes")
-            if not isinstance(episode_metadata, Mapping):
-                raise ValueError("Feature metadata is missing its episode manifest")
-            all_source_files = discover_episode_files(self.root_dir, mode="all")
-            expected_episode_names = {path.name for path in all_source_files}
-            if set(episode_metadata) != expected_episode_names:
-                raise ValueError(
-                    "DINOv3 feature manifest does not exactly cover the source episodes"
-                )
-            manifest_total = sum(
-                int(entry.get("frames", -1))
-                for entry in episode_metadata.values()
-                if isinstance(entry, Mapping)
-            )
-            if self.feature_metadata.get("total_frames") != manifest_total:
-                raise ValueError("DINOv3 cache total_frames does not match its manifest")
-            for path in self.file_paths:
-                entry = episode_metadata.get(path.name)
-                if not isinstance(entry, Mapping):
-                    raise ValueError(f"Feature metadata has no entry for {path.name}")
-                if entry.get("source_bytes") != path.stat().st_size:
-                    raise ValueError(
-                        f"Source HDF5 size changed after caching: {path.name}; "
-                        "regenerate DINOv3 features"
-                    )
-                with h5py.File(path, "r") as root:
-                    image_key = f"observation/{self.camera_name}/rgb"
-                    if image_key not in root or "joint_action/vector" not in root:
-                        raise KeyError(f"{path.name} lacks RGB or joint_action/vector")
-                    frames = len(root["joint_action/vector"])
-                    if len(root[image_key]) != frames or entry.get("frames") != frames:
-                        raise ValueError(f"Feature frame manifest mismatch: {path.name}")
-                source_sha256 = entry.get("source_sha256")
-                feature_sha256 = entry.get("feature_sha256")
-                if not isinstance(source_sha256, str) or len(source_sha256) != 64:
-                    raise ValueError(f"Missing source SHA-256 for {path.name}")
-                if not isinstance(feature_sha256, str) or len(feature_sha256) != 64:
-                    raise ValueError(f"Missing feature SHA-256 for {path.name}")
-                if _sha256_file(path) != source_sha256:
-                    raise ValueError(f"Source HDF5 checksum changed: {path.name}")
-                if _sha256_file(self._feature_path(path)) != feature_sha256:
-                    raise ValueError(f"DINOv3 feature checksum changed: {path.name}")
 
     def __len__(self) -> int:
         return len(self.file_paths)
@@ -462,36 +416,17 @@ class RGBJointTrajectoryDataset(Dataset):
                 f"RGB/joint trajectory length mismatch: rgb={len(dataset)}, "
                 f"joint={expected_length}"
             )
-        images: List[np.ndarray] = []
-        for frame_index in frame_indices.tolist():
+        images = np.empty(
+            (len(frame_indices), 3, *RESNET18_IMAGE_HW), dtype=np.float32
+        )
+        for output_index, frame_index in enumerate(frame_indices.tolist()):
             image = _decode_robotwin_rgb(dataset[frame_index])
             if tuple(image.shape[:2]) != self.image_hw:
                 raise ValueError(
                     f"RMBench RGB frame has {tuple(image.shape[:2])}, expected {self.image_hw}"
                 )
-            images.append(np.ascontiguousarray(image.transpose(2, 0, 1)))
-        image_array = np.stack(images, axis=0)
-        return torch.from_numpy(image_array)
-
-    def _feature_path(self, episode_path: Path) -> Path:
-        if self.feature_root is None:
-            raise RuntimeError("No feature_root was configured")
-        return self.feature_root / f"{episode_path.stem}.npy"
-
-    def _load_cached_features(
-        self, episode_path: Path, expected_length: int, frame_indices: np.ndarray
-    ) -> torch.Tensor:
-        features = np.load(self._feature_path(episode_path), mmap_mode="r", allow_pickle=False)
-        expected_shape = (expected_length, DINOV3_CACHE_TOKENS, DINOV3_FEATURE_DIM)
-        if features.shape != expected_shape or features.dtype != np.float32:
-            raise ValueError(
-                f"Bad DINOv3 cache for {episode_path.name}: "
-                f"shape={features.shape}, dtype={features.dtype}, expected={expected_shape}/float32"
-            )
-        selected = np.asarray(features[frame_indices], dtype=np.float32)
-        if not np.isfinite(selected).all():
-            raise FloatingPointError(f"Non-finite DINOv3 cache: {episode_path.name}")
-        return torch.from_numpy(selected.copy())
+            images[output_index] = preprocess_rgb_numpy(image)
+        return torch.from_numpy(images)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         path = self.file_paths[index]
@@ -501,19 +436,9 @@ class RGBJointTrajectoryDataset(Dataset):
             if image_key not in root:
                 raise KeyError(f"{path.name} does not contain {image_key!r}")
             frame_indices = self._window_indices(obs_np.shape[0])
-            if self.feature_root is None:
-                vision = self._load_images(
-                    root[image_key], expected_length=obs_np.shape[0], frame_indices=frame_indices
-                )
-            else:
-                if len(root[image_key]) != obs_np.shape[0]:
-                    raise ValueError(
-                        f"RGB/joint length mismatch: rgb={len(root[image_key])}, "
-                        f"joint={obs_np.shape[0]}"
-                    )
-                vision = self._load_cached_features(
-                    path, expected_length=obs_np.shape[0], frame_indices=frame_indices
-                )
+            vision = self._load_images(
+                root[image_key], expected_length=obs_np.shape[0], frame_indices=frame_indices
+            )
 
         actions_np = self._make_future_actions(obs_np.copy())
         obs_np = obs_np[frame_indices]
@@ -521,14 +446,13 @@ class RGBJointTrajectoryDataset(Dataset):
         obs = torch.from_numpy(obs_np)
         actions = torch.from_numpy(actions_np)
         obs, actions = self._normalize(obs, actions)
-        result = {
+        return {
             "obs": obs,
             "actions": actions,
+            "image": vision,
             "mask": torch.zeros(obs.shape[0], dtype=torch.bool),
             "episode_index": torch.tensor(index, dtype=torch.long),
         }
-        result["image_features" if self.feature_root is not None else "image"] = vision
-        return result
 
     def fit_scaler(self) -> Scaler:
         """Fit only from this dataset's episodes; images are not decoded."""
@@ -562,40 +486,34 @@ def parallel_collate_fn_rgb_joint(
     max_length = max(lengths)
     batch_size = len(batch)
     future_steps, action_dim = batch[0]["actions"].shape[1:]
-    has_cached_features = "image_features" in batch[0]
-    if any(("image_features" in item) != has_cached_features for item in batch):
-        raise ValueError("A batch cannot mix raw images and cached DINOv3 features")
-    if has_cached_features:
-        token_count, feature_dim = batch[0]["image_features"].shape[1:]
-    else:
-        channels, height, width = batch[0]["image"].shape[1:]
+    channels, height, width = batch[0]["image"].shape[1:]
+    expected_image_shape = (3, *RESNET18_IMAGE_HW)
+    if (channels, height, width) != expected_image_shape:
+        raise ValueError(
+            f"Expected preprocessed image shape {expected_image_shape}, "
+            f"got {(channels, height, width)}"
+        )
 
     obs = torch.zeros(batch_size, max_length, JOINT_DIM, dtype=torch.float32)
     actions = torch.zeros(
         batch_size, max_length, future_steps, action_dim, dtype=torch.float32
     )
-    if has_cached_features:
-        vision = torch.zeros(
-            batch_size,
-            max_length,
-            token_count,
-            feature_dim,
-            dtype=torch.float32,
-        )
-    else:
-        vision = torch.zeros(
-            batch_size, max_length, channels, height, width, dtype=torch.uint8
-        )
+    vision = torch.zeros(
+        batch_size, max_length, channels, height, width, dtype=torch.float32
+    )
     mask = torch.ones(batch_size, max_length, dtype=torch.bool)
     episode_indices = torch.empty(batch_size, dtype=torch.long)
     for batch_index, item in enumerate(batch):
         length = lengths[batch_index]
-        vision_key = "image_features" if has_cached_features else "image"
-        if tuple(item[vision_key].shape[1:]) != tuple(vision.shape[2:]):
+        if item["image"].dtype != torch.float32:
+            raise TypeError(
+                f"Preprocessed RGB must be torch.float32, got {item['image'].dtype}"
+            )
+        if tuple(item["image"].shape[1:]) != tuple(vision.shape[2:]):
             raise ValueError("All vision entries in a batch must share a shape")
         obs[batch_index, :length] = item["obs"]
         actions[batch_index, :length] = item["actions"]
-        vision[batch_index, :length] = item[vision_key]
+        vision[batch_index, :length] = item["image"]
         mask[batch_index, :length] = False
         episode_indices[batch_index] = item["episode_index"]
     result = {
@@ -604,8 +522,8 @@ def parallel_collate_fn_rgb_joint(
         "mask": mask,
         "episode_index": episode_indices,
         "lengths": torch.tensor(lengths, dtype=torch.long),
+        "image": vision,
     }
-    result["image_features" if has_cached_features else "image"] = vision
     return result
 
 

@@ -1,4 +1,4 @@
-"""DINOv3 RGB plus native 14-D joint Chronos policy for RMBench.
+"""Official ResNet-18 RGB plus native 14-D joint Chronos for RMBench.
 
 This is intentionally separate from ``Chronos_RGB`` (the 16-D EE variant).
 """

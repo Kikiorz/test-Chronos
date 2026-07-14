@@ -1,8 +1,8 @@
-# RMBench head-camera DINOv3 RGB + native dual-arm 14-D joint evaluation.
+# RMBench head-camera ResNet-18 RGB + native dual-arm 14-D joint evaluation.
 policy_name: Chronos_RGB_Joint
 task_name: null
 task_config: null
-ckpt_setting: rgb_head_joint14_dinov3b
+ckpt_setting: rgb_head_joint14_resnet18
 seed: 42
 instruction_type: unseen
 

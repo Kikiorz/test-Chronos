@@ -71,6 +71,13 @@ def test_joint_scaler_roundtrip_and_per_horizon_statistics() -> None:
         }
     )
     scaler.fit(data)
+    # The released scaler uses the sample standard deviation (Bessel corrected).
+    torch.testing.assert_close(
+        scaler.std_dict[JOINT_KEYS[0]],
+        observations[:, :1].std(dim=0, unbiased=True),
+        rtol=0,
+        atol=0,
+    )
     normalized = scaler.normalize(data)
     restored = scaler.denormalize(normalized)
     for key in data:
@@ -125,21 +132,8 @@ def test_scaler_fingerprint_and_dark_uint8_rgb_are_unambiguous() -> None:
         }
     }
     image = _extract_head_rgb(observation, "head_camera")
-    np.testing.assert_allclose(image, np.float32(1.0 / 255.0), rtol=0, atol=1e-8)
-
-    # Cache extraction converts uint8 on CUDA.  Cover every byte value and
-    # require the online NumPy path to produce the exact same float32 bits.
-    if torch.cuda.is_available():
-        byte_values = np.arange(256, dtype=np.uint8)
-        expected = (
-            torch.arange(256, dtype=torch.uint8, device="cuda")
-            .float()
-            .div(255)
-            .cpu()
-            .numpy()
-        )
-        actual = byte_values.astype(np.float32) * np.float32(1.0 / 255.0)
-        np.testing.assert_array_equal(actual, expected)
+    assert image.dtype == np.uint8
+    np.testing.assert_array_equal(image, np.ones((240, 320, 3), dtype=np.uint8))
 
     ambiguous = {
         "observation": {
@@ -150,8 +144,8 @@ def test_scaler_fingerprint_and_dark_uint8_rgb_are_unambiguous() -> None:
     }
     try:
         _extract_head_rgb(ambiguous, "head_camera")
-    except ValueError as exc:
-        assert "ambiguous scale" in str(exc)
+    except TypeError as exc:
+        assert "uint8" in str(exc)
     else:
         raise AssertionError("Ambiguous float RGB scale was silently accepted")
 
@@ -167,6 +161,7 @@ def test_online_observation_order_and_qpos_execution() -> None:
     encoded = encode_obs(observation)
     torch.testing.assert_close(encoded["qpos"], torch.from_numpy(vector).unsqueeze(0))
     assert encoded["image"].shape == (1, 3, 240, 320)
+    assert encoded["image"].dtype == torch.uint8
 
     class FakeModel:
         camera_name = "head_camera"
