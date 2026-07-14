@@ -51,7 +51,7 @@ From the repository root:
 
 ```bash
 conda run -n RoboTwin python RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py \
-  --data-root /home/zeno-rp/2026test/rmbench_rgb_dataset/data/cover_blocks/demo_clean/data \
+  --data-root /path/to/cover_blocks/demo_clean/data \
   --task-name cover_blocks \
   --batch-size 1 \
   --vision-chunk-size 32 \
