@@ -35,6 +35,12 @@ OBS_KEYS = [
 ]
 ACT_KEYS = [f"{key}_act" for key in OBS_KEYS]
 
+# A frame at index t contains the state observed before the next control
+# command.  Chronos_RGB V2 therefore supervises horizon zero with state t+1,
+# not a copy of the current observation at t.  Keep this contract shared by
+# dataset loading and scaler fitting.
+ACTION_TARGET_OFFSET = 1
+
 
 def make_lowdim_dict(future_steps: int = 16) -> Dict[str, object]:
     result: Dict[str, object] = {key: 1 for key in OBS_KEYS}
@@ -44,6 +50,29 @@ def make_lowdim_dict(future_steps: int = 16) -> Dict[str, object]:
 
 def make_ee_scaler(future_steps: int = 16) -> Scaler:
     return Scaler(make_lowdim_dict(future_steps))
+
+
+def make_future_action_targets(
+    action_data: np.ndarray,
+    future_steps: int = 16,
+    target_offset: int = ACTION_TARGET_OFFSET,
+) -> np.ndarray:
+    """Return targets ``[t+offset, ..., t+offset+Q-1]`` with tail clamping."""
+
+    action_data = np.asarray(action_data)
+    if action_data.ndim < 1 or action_data.shape[0] == 0:
+        raise ValueError("Empty action trajectory")
+    if future_steps <= 0:
+        raise ValueError(f"future_steps must be positive, got {future_steps}")
+    if target_offset < 0:
+        raise ValueError(f"target_offset must be non-negative, got {target_offset}")
+    indices = np.minimum(
+        np.arange(action_data.shape[0], dtype=np.int64)[:, None]
+        + int(target_offset)
+        + np.arange(int(future_steps), dtype=np.int64)[None, :],
+        action_data.shape[0] - 1,
+    )
+    return action_data[indices].astype(np.float32, copy=False)
 
 
 def _natural_episode_key(path: Path) -> Tuple[object, ...]:
@@ -158,7 +187,7 @@ def _decode_robotwin_rgb(value: object) -> np.ndarray:
 
 
 class RGBTrajectoryDataset(Dataset):
-    """One HDF5 episode per sample, with 16-D EE state and future actions.
+    """One HDF5 episode per sample, with 16-D EE state and next-state targets.
 
     Returns ``image`` as uint8 RGB ``[L,3,H,W]``.  Keeping full trajectories in
     uint8 reduces loader RAM by 4x.  Float conversion and ImageNet normalization
@@ -176,12 +205,13 @@ class RGBTrajectoryDataset(Dataset):
         camera_name: str = "head_camera",
         val_fraction: float = 0.1,
         split_seed: int = 42,
+        action_target_offset: int = ACTION_TARGET_OFFSET,
         sequence_length: Optional[int] = None,
         random_window: Optional[bool] = None,
     ):
         super().__init__()
         if future_steps != 16:
-            raise ValueError("Chronos_RGB V1 fixes future_steps=16 for a controlled comparison")
+            raise ValueError("Chronos_RGB V2 fixes future_steps=16 for a controlled comparison")
         if len(image_hw) != 2 or min(int(image_hw[0]), int(image_hw[1])) <= 0:
             raise ValueError(f"image_hw must be (height,width), got {image_hw}")
         self.root_dir = Path(root_dir).expanduser().resolve()
@@ -192,6 +222,9 @@ class RGBTrajectoryDataset(Dataset):
         self.camera_name = camera_name
         self.val_fraction = float(val_fraction)
         self.split_seed = int(split_seed)
+        self.action_target_offset = int(action_target_offset)
+        if self.action_target_offset < 0:
+            raise ValueError("action_target_offset must be non-negative")
         # Optional short windows exist only for lightweight data diagnostics.
         # The formal training CLI never enables this: RGB fusion and Mamba see
         # the full episode, while only expensive head-loss timesteps are sampled.
@@ -205,6 +238,7 @@ class RGBTrajectoryDataset(Dataset):
         print(
             f"[{mode}] Chronos RGB: {len(self.file_paths)} episodes | "
             f"camera={camera_name} | image_hw={self.image_hw} | "
+            f"action_offset={self.action_target_offset} | "
             f"window={self.sequence_length or 'full'} | root={self.root_dir}"
         )
 
@@ -235,15 +269,11 @@ class RGBTrajectoryDataset(Dataset):
         return obs.astype(np.float32, copy=False)
 
     def _make_future_actions(self, action_data: np.ndarray) -> np.ndarray:
-        length = action_data.shape[0]
-        if length == 0:
-            raise ValueError("Empty HDF5 episode")
-        indices = np.minimum(
-            np.arange(length, dtype=np.int64)[:, None]
-            + np.arange(self.future_steps, dtype=np.int64)[None, :],
-            length - 1,
+        return make_future_action_targets(
+            action_data,
+            future_steps=self.future_steps,
+            target_offset=self.action_target_offset,
         )
-        return action_data[indices].astype(np.float32, copy=False)
 
     @staticmethod
     def _to_key_dict(tensor: torch.Tensor, keys: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -391,6 +421,7 @@ def _main() -> None:
     parser.add_argument("--output", required=True, help="Output .pth scaler path")
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--action-target-offset", type=int, default=ACTION_TARGET_OFFSET)
     args = parser.parse_args()
     dataset = RGBTrajectoryDataset(
         args.data_root,
@@ -398,6 +429,7 @@ def _main() -> None:
         scaler=None,
         val_fraction=args.val_fraction,
         split_seed=args.split_seed,
+        action_target_offset=args.action_target_offset,
     )
     scaler = dataset.fit_scaler()
     scaler.save(args.output)

@@ -68,10 +68,19 @@ class MambaRGBController:
         self.sample_steps = int(args.get("sample_steps", 5))
         self.temporal_agg = bool(args.get("temporal_agg", True))
         self.temporal_decay = float(args.get("temporal_decay", 0.01))
+        self.execution_horizon_offset = int(args.get("execution_horizon_offset", 0))
+        self.visual_architecture = str(args.get("visual_architecture", "v2")).lower()
         if self.future_steps <= 0 or self.sample_steps <= 0:
             raise ValueError("future_steps and sample_steps must both be positive")
         if self.temporal_decay < 0:
             raise ValueError("temporal_decay must be non-negative")
+        if not 0 <= self.execution_horizon_offset < self.future_steps:
+            raise ValueError(
+                "execution_horizon_offset must be in "
+                f"[0, {self.future_steps - 1}], got {self.execution_horizon_offset}"
+            )
+        if self.visual_architecture not in {"v1", "v2"}:
+            raise ValueError("visual_architecture must be explicitly 'v1' or 'v2'")
 
         config = MambaConfig()
         config.embed_dim = 1024
@@ -81,6 +90,17 @@ class MambaRGBController:
         config.num_blocks = 6
         config.future_steps = self.future_steps
         config.camera_names = [self.camera_name]
+        config.visual_architecture = self.visual_architecture
+
+        # The architecture is explicit and defaults to V2.  Never infer V1
+        # from a checkpoint silently: a V1 checkpoint passed to the V2 default
+        # must fail strict loading unless the diagnostic explicitly selects V1.
+        sys.modules.setdefault("mamba_policy_par_2D_IMLE_EE", mamba_policy_par_2D_IMLE_EE)
+        self.ckpt_path = _existing_file(args["ckpt_path"], "RGB checkpoint")
+        print(f"[MambaRGBController] Reading checkpoint: {self.ckpt_path}")
+        checkpoint = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
+        uses_ema = isinstance(checkpoint, Mapping) and "ema_policy_state_dict" in checkpoint
+        state = _policy_state_dict(checkpoint)
         self.config = config
 
         lowdim_shapes: dict[str, object] = {key: 1 for key in EE_KEYS}
@@ -92,7 +112,10 @@ class MambaRGBController:
         self.scaler.to(self.device)
         self.scaler.eval()
 
-        print("[MambaRGBController] Initializing RGB EE MambaPolicy")
+        print(
+            "[MambaRGBController] Initializing RGB EE MambaPolicy "
+            f"architecture={self.visual_architecture}"
+        )
         self.policy = MambaPolicy(
             camera_names=config.camera_names,
             embed_dim=config.embed_dim,
@@ -106,19 +129,10 @@ class MambaRGBController:
             # Avoid an unnecessary network download before strict loading.
             pretrained_backbone=False,
             freeze_backbone=True,
+            visual_architecture=self.visual_architecture,
         ).to(self.device)
 
-        # torch.load may need this top-level name to unpickle MambaConfig from
-        # a Lightning checkpoint produced by the standalone training script.
-        sys.modules.setdefault("mamba_policy_par_2D_IMLE_EE", mamba_policy_par_2D_IMLE_EE)
-        self.ckpt_path = _existing_file(args["ckpt_path"], "RGB checkpoint")
         print(f"[MambaRGBController] Loading checkpoint strictly: {self.ckpt_path}")
-        # Keep checkpoint tensors on CPU while copying them into the policy;
-        # mapping the whole checkpoint to CUDA would temporarily duplicate the
-        # model weights in GPU memory.
-        checkpoint = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-        uses_ema = isinstance(checkpoint, Mapping) and "ema_policy_state_dict" in checkpoint
-        state = _policy_state_dict(checkpoint)
         self.policy.load_state_dict(state, strict=True)
         num_loaded_tensors = len(state)
         del state, checkpoint
@@ -186,12 +200,12 @@ class MambaRGBController:
             source_row = source_step % self.future_steps
             if self._ring_source_steps[source_row] != source_step:
                 continue
-            horizon = self.t - source_step
+            horizon = self.t - source_step + self.execution_horizon_offset
             if horizon < self.future_steps:
                 candidates.append(self._action_ring[source_row, horizon])
 
         if not candidates:
-            return sequence[0]
+            return sequence[self.execution_horizon_offset]
         stacked = torch.stack(candidates, dim=0)
         # Preserve the released controller's exact ordering and weighting:
         # candidates are old -> new, and exp(-k * index) gives the oldest
@@ -227,7 +241,7 @@ class MambaRGBController:
         if self.temporal_agg:
             action = self._ensemble(predicted)
         else:
-            action = predicted[0]
+            action = predicted[self.execution_horizon_offset]
         self.t += 1
 
         if not torch.isfinite(action).all():

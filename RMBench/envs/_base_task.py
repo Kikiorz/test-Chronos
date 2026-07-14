@@ -64,6 +64,13 @@ class Base_Task(gym.Env):
         self.save_dir = kwags.get("save_path", "data")
         self.ep_num = kwags.get("now_ep_num", 0)
         self.render_freq = kwags.get("render_freq", 10)
+        # Evaluation only needs a fresh camera image at policy boundaries.
+        # Keeping this configurable preserves the released behavior while
+        # allowing headless rollouts to skip redundant renders inside a
+        # single low-level planned path.
+        self.eval_render_each_control_step = kwags.get(
+            "eval_render_each_control_step", True
+        )
         self.data_type = kwags.get("data_type", None)
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
@@ -1710,7 +1717,8 @@ class Base_Task(gym.Env):
                     now_right_id += 1
 
             self.scene.step()
-            self._update_render()
+            if self.eval_render_each_control_step:
+                self._update_render()
                 
             if self.check_success():
                 self.eval_success = True

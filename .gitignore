@@ -178,6 +178,13 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Robot-learning runtime artifacts (never publish data or learned weights).
+*.ckpt
+*.pth
+*.h5
+*.hdf5
+events.out.tfevents.*
+
 # Cython debug symbols
 cython_debug/
 

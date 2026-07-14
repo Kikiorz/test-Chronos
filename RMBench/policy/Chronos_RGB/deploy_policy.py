@@ -113,6 +113,8 @@ def get_model(usr_args: Mapping[str, Any]) -> MambaRGBController:
         "sample_steps": int(usr_args.get("sample_steps", 5)),
         "temporal_agg": bool(usr_args.get("temporal_agg", True)),
         "temporal_decay": float(usr_args.get("temporal_decay", 0.01)),
+        "execution_horizon_offset": int(usr_args.get("execution_horizon_offset", 0)),
+        "visual_architecture": str(usr_args.get("visual_architecture", "v2")),
     }
     return MambaRGBController(controller_args)
 
