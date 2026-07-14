@@ -1,0 +1,21 @@
+# RMBench head-camera DINOv3 RGB + native dual-arm 14-D joint evaluation.
+policy_name: Chronos_RGB_Joint
+task_name: null
+task_config: null
+ckpt_setting: rgb_head_joint14_dinov3b
+seed: 42
+instruction_type: unseen
+
+# Paths are resolved from RMBench/ by script/eval_policy.py.
+ckpt_path: policy/Chronos_RGB_Joint/checkpoints/cover_blocks/Joint_14/last.ckpt
+scaler_path: policy/Chronos_RGB_Joint/scaler_cover_blocks_joint_rgb.pth
+
+camera_name: head_camera
+future_steps: 16
+sample_steps: 5
+temporal_agg: true
+temporal_decay: 0.01
+clip_to_training_range: true
+training_range_margin: 0.05
+device: auto
+gpu_id: 0
