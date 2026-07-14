@@ -80,6 +80,28 @@ def test_joint_scaler_roundtrip_and_per_horizon_statistics() -> None:
         scaler.mean_dict[ACTION_KEYS[0]][0], scaler.mean_dict[ACTION_KEYS[0]][-1]
     )
 
+    # A transposed/missing horizon must never be accepted through broadcasting.
+    try:
+        scaler.denormalize({ACTION_KEYS[0]: torch.zeros(2, 1, 16)})
+    except ValueError as exc:
+        assert "must end in (16, 1)" in str(exc)
+    else:
+        raise AssertionError("A misordered action horizon was silently broadcast")
+
+    try:
+        scaler.normalize({JOINT_KEYS[0]: torch.zeros(2, 1, dtype=torch.float64)})
+    except TypeError as exc:
+        assert "torch.float32" in str(exc)
+    else:
+        raise AssertionError("A float64 joint input silently changed normalization precision")
+
+    try:
+        scaler.normalize({"misspelled_joint": torch.zeros(2, 1)})
+    except KeyError as exc:
+        assert "unknown key" in str(exc)
+    else:
+        raise AssertionError("An unknown scaler key was silently passed through")
+
 
 def test_scaler_fingerprint_and_dark_uint8_rgb_are_unambiguous() -> None:
     scaler = make_joint_scaler(16)

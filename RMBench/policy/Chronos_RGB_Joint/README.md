@@ -215,6 +215,14 @@ potentially small `/tmp`. The short path also leaves room for Linux DataLoader
 This changes checkpoint cadence only, not optimization, validation, or model
 behavior.
 
+Because a five-epoch full-checkpoint cadence can miss the exact best validation
+epoch, formal EMA training also keeps one compact `best-ema-deploy.pth`. It is
+updated atomically after every strictly improved deterministic validation loss,
+persists its best score across resume, and contains the complete EMA policy,
+embedded scaler, contract, epoch, and loss. This adds checkpoint I/O only; it
+does not alter optimization or the full resume cadence. The compact best file
+is a model artifact and remains outside Git.
+
 Resume is preflighted before Lightning restores any tensor.  Backbone SHA,
 cache preprocessing/data fingerprints, scaler fingerprint, joint contract, and
 train/validation episode lists must all match.  This prevents an old frozen
@@ -235,17 +243,22 @@ For a short diagnostic only, append:
 
 Formal training must leave `--overfit-batches` at zero.
 
-For evaluation, strip raw optimizer state and keep only the complete EMA policy,
+For evaluation, prefer the automatically selected `best-ema-deploy.pth`. To
+manually strip a full top-k checkpoint, keep only the complete EMA policy,
 contract, and scaler state (about 1.5 GiB):
 
 ```bash
 conda run --no-capture-output -n RoboTwin \
   python RMBench/policy/Chronos_RGB_Joint/export_deploy_checkpoint.py \
-  --input /external/run/Joint_14/last.ckpt \
-  --output /external/run/Joint_14/last-ema-deploy.pth
+  --input '/external/run/Joint_14/mamba-best-epoch=0124-val_loss=0.00123.ckpt' \
+  --output /external/run/Joint_14/manual-ema-deploy.pth
 ```
 
-The compact file is still a model artifact and must not be committed.
+The exporter attaches validation-selection metadata only when its input path is
+explicitly present in Lightning's `best_k_models` map. A rotating resume
+checkpoint can contain a stale `current_score` when the current epoch did not
+enter top-k, so that field is intentionally never trusted. The compact file is
+still a model artifact and must not be committed.
 
 ## Evaluation
 
@@ -255,7 +268,7 @@ From `RMBench/`:
 conda activate RoboTwin
 bash policy/Chronos_RGB_Joint/eval.sh cover_blocks demo_clean_rgb_joint \
   rgb_head_joint14_dinov3b 42 0 5 \
-  /external/run/Joint_14/last.ckpt \
+  /external/run/Joint_14/best-ema-deploy.pth \
   /external/run/scaler_cover_blocks_joint_rgb.pth
 ```
 

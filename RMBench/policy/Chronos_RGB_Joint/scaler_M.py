@@ -116,21 +116,46 @@ class Scaler(nn.Module):
             if not torch.all((mean >= minimum - tolerance) & (mean <= maximum + tolerance)):
                 raise ValueError(f"Scaler mean lies outside min/max for {key!r}")
 
+    def _validate_transform_value(self, key: str, value: torch.Tensor) -> None:
+        """Reject silent broadcasting or precision/device changes at the boundary."""
+
+        if key not in self.lowdim_dict:
+            raise KeyError(f"Scaler received an unknown key: {key!r}")
+        if not torch.is_tensor(value):
+            raise TypeError(f"Scaler value for {key!r} must be a tensor")
+        statistic = self.mean_dict[key]
+        expected_shape = tuple(statistic.shape)
+        if (
+            value.ndim < len(expected_shape)
+            or tuple(value.shape[-len(expected_shape):]) != expected_shape
+        ):
+            raise ValueError(
+                f"Scaler value for {key!r} must end in {expected_shape}; "
+                f"got {tuple(value.shape)}"
+            )
+        if value.dtype != statistic.dtype:
+            raise TypeError(
+                f"Scaler value for {key!r} must use {statistic.dtype}; got {value.dtype}"
+            )
+        if value.device != statistic.device:
+            raise RuntimeError(
+                f"Scaler value for {key!r} is on {value.device}, but its statistics "
+                f"are on {statistic.device}"
+            )
+
     def normalize(self, data_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {
-            key: (value - self.mean_dict[key]) / self.std_dict[key]
-            if key in self.lowdim_dict
-            else value
-            for key, value in data_dict.items()
-        }
+        normalized: Dict[str, torch.Tensor] = {}
+        for key, value in data_dict.items():
+            self._validate_transform_value(key, value)
+            normalized[key] = (value - self.mean_dict[key]) / self.std_dict[key]
+        return normalized
 
     def denormalize(self, data_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {
-            key: value * self.std_dict[key] + self.mean_dict[key]
-            if key in self.lowdim_dict
-            else value
-            for key, value in data_dict.items()
-        }
+        denormalized: Dict[str, torch.Tensor] = {}
+        for key, value in data_dict.items():
+            self._validate_transform_value(key, value)
+            denormalized[key] = value * self.std_dict[key] + self.mean_dict[key]
+        return denormalized
 
     def save(self, filepath: str | Path) -> None:
         self.validate_fitted()

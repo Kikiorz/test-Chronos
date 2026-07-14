@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint
 
 try:
+    from .best_ema_checkpoint import BestEMADeployCheckpoint
     from .M_dataset_robotwinRGB_J import (
         RGBJointTrajectoryDataset,
         discover_episode_files,
@@ -36,6 +37,7 @@ try:
     from .ema_callback import WarmupPolicyEMACallback
     from .scaler_M import Scaler
 except ImportError:  # direct script execution
+    from best_ema_checkpoint import BestEMADeployCheckpoint
     from M_dataset_robotwinRGB_J import (
         RGBJointTrajectoryDataset,
         discover_episode_files,
@@ -783,6 +785,7 @@ def main(argv=None) -> None:
     callbacks = []
     if not args.no_ema:
         callbacks.append(WarmupPolicyEMACallback(max_value=0.9999))
+        callbacks.append(BestEMADeployCheckpoint(output_dir / "best-ema-deploy.pth"))
     callbacks.append(
         ModelCheckpoint(
             dirpath=output_dir,
