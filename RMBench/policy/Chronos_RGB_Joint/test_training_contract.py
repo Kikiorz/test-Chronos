@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -10,7 +11,34 @@ import torch
 from .M_dataset_robotwinRGB_J import ACTION_KEYS, JOINT_KEYS, make_joint_scaler
 from .contracts import base_policy_contract
 from .ema_callback import WarmupPolicyEMACallback
-from .train_par_2D_IMLE_Joint import _validate_resume_checkpoint
+from .train_par_2D_IMLE_Joint import (
+    _configure_large_temp_dir,
+    _validate_resume_checkpoint,
+)
+
+
+def test_large_temp_dir_is_atomic_and_af_unix_safe() -> None:
+    old_tempdir = tempfile.tempdir
+    old_tmpdir = os.environ.get("TMPDIR")
+    try:
+        # A short system-temp sandbox makes this test independent of the
+        # repository's path depth; source and destination share one device.
+        with tempfile.TemporaryDirectory(prefix="cjt-") as directory:
+            root = Path(directory)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            selected = _configure_large_temp_dir(output_dir, root / "t")
+            assert selected.stat().st_dev == output_dir.stat().st_dev
+            assert os.environ["TMPDIR"] == str(selected)
+            assert tempfile.tempdir == str(selected)
+            probe = selected / "pymp-00000000" / "listener-00000000"
+            assert len(os.fsencode(probe)) + 1 <= 108
+    finally:
+        tempfile.tempdir = old_tempdir
+        if old_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = old_tmpdir
 
 
 def test_resume_contract_binds_embedded_scaler_and_split() -> None:

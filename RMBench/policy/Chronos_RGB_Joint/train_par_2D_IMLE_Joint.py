@@ -381,6 +381,53 @@ def _resolve_resume(value: str, output_dir: Path) -> str | None:
     return str(resolved)
 
 
+def _configure_large_temp_dir(
+    output_dir: Path, requested_dir: str | Path | None = None
+) -> Path:
+    """Put large atomic checkpoint files on the output filesystem.
+
+    PyTorch DataLoader workers also use :mod:`tempfile` for AF_UNIX resource
+    sharing sockets. Linux limits those socket paths to 107 bytes, so a long
+    run-specific directory can fail before the first validation batch. Keep a
+    deliberately short shared sibling by default and reject paths that cannot
+    accommodate multiprocessing's ``pymp-*/listener-*`` suffix.
+    """
+
+    temp_dir = (
+        Path(requested_dir).expanduser().resolve()
+        if requested_dir is not None
+        else (output_dir.parent / ".tmp").resolve()
+    )
+    temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if temp_dir.stat().st_dev != output_dir.parent.stat().st_dev:
+        raise ValueError(
+            "Checkpoint temp directory must be on the same filesystem as --output-dir "
+            "so multi-gigabyte atomic renames cannot fail with EXDEV: "
+            f"temp={temp_dir}, output={output_dir}"
+        )
+
+    # multiprocessing.util.get_temp_dir() creates exactly this shape before
+    # Listener adds its random basename. Use eight placeholder characters,
+    # matching tempfile's current random-name length, plus one byte for the
+    # terminating NUL in sockaddr_un.sun_path[108].
+    socket_probe = temp_dir / "pymp-00000000" / "listener-00000000"
+    socket_bytes = len(os.fsencode(socket_probe)) + 1
+    if socket_bytes > 108:
+        raise ValueError(
+            "Checkpoint temp directory is too long for Linux DataLoader AF_UNIX "
+            f"sockets ({socket_bytes} > 108 bytes with suffix): {temp_dir}. "
+            "Pass --temp-dir with a shorter path on the output filesystem."
+        )
+    if not os.access(temp_dir, os.W_OK | os.X_OK):
+        raise PermissionError(f"Checkpoint temp directory is not writable: {temp_dir}")
+
+    # tempfile.tempdir covers the current/forked process; TMPDIR also covers
+    # spawned workers and subprocesses. Files live on the large output disk.
+    os.environ["TMPDIR"] = str(temp_dir)
+    tempfile.tempdir = str(temp_dir)
+    return temp_dir
+
+
 def _validate_resume_checkpoint(
     checkpoint_path: str, expected_contract: Mapping[str, object]
 ) -> None:
@@ -440,6 +487,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-name", default="cover_blocks")
     parser.add_argument(
         "--output-dir", default=str(here / "checkpoints" / "cover_blocks" / "Joint_14")
+    )
+    parser.add_argument(
+        "--temp-dir",
+        default=None,
+        help=(
+            "Short temp directory on the output filesystem for atomic checkpoints and "
+            "DataLoader sockets (default: <output-parent>/.tmp)"
+        ),
     )
     parser.add_argument("--scaler-path", default=str(here / "scaler_cover_blocks_joint_rgb.pth"))
     parser.add_argument(
@@ -522,11 +577,11 @@ def main(argv=None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     scaler_path.parent.mkdir(parents=True, exist_ok=True)
     # Lightning/FSSpec stages atomic checkpoints through tempfile.mkstemp().
-    # /tmp may be much smaller than a full raw+EMA+Adam checkpoint, so stage on
-    # the same filesystem as the destination and keep the final rename atomic.
-    checkpoint_temp_dir = output_dir.parent / f".{output_dir.name}.checkpoint_tmp"
-    checkpoint_temp_dir.mkdir(parents=True, exist_ok=True)
-    tempfile.tempdir = str(checkpoint_temp_dir)
+    # /tmp may be much smaller than a full raw+EMA+Adam checkpoint. The helper
+    # keeps staging on the output filesystem while reserving AF_UNIX path space
+    # for DataLoader workers.
+    checkpoint_temp_dir = _configure_large_temp_dir(output_dir, args.temp_dir)
+    print(f"Large-file/checkpoint temp directory: {checkpoint_temp_dir}")
     resume = _resolve_resume(args.resume, output_dir)
 
     if args.expected_episodes < 0:

@@ -208,9 +208,12 @@ matching vector length alone is not a valid robot contract.
 it contains raw policy, EMA policy, and Adam moments.  The default writes
 one rotating resume checkpoint (with an atomic `last.ckpt` symlink) plus the
 best two full checkpoints every five epochs, and disables extra periodic
-copies.  Checkpoint temporary files are staged beside the output rather than
-in a potentially small `/tmp`.  This changes checkpoint cadence only, not
-optimization, validation, or model behavior.
+copies. Checkpoint temporary files are staged in the short
+`<output-parent>/.tmp` directory on the same filesystem rather than in a
+potentially small `/tmp`. The short path also leaves room for Linux DataLoader
+`AF_UNIX` worker sockets; an unsafe `--temp-dir` is rejected before training.
+This changes checkpoint cadence only, not optimization, validation, or model
+behavior.
 
 Resume is preflighted before Lightning restores any tensor.  Backbone SHA,
 cache preprocessing/data fingerprints, scaler fingerprint, joint contract, and

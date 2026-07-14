@@ -23,6 +23,12 @@ exec conda run --no-capture-output -n "${conda_env}" \
   --output-dir "${run_root}/Joint_14" \
   --scaler-path "${run_root}/scaler_cover_blocks_joint_rgb.pth" \
   --expected-episodes 50 \
+  --seed 42 \
+  --split-seed 42 \
+  --validation-seed 42 \
+  --val-fraction 0.1 \
+  --image-height 240 \
+  --image-width 320 \
   --batch-size 1 \
   --num-workers 2 \
   --vision-chunk-size 128 \
@@ -38,5 +44,6 @@ exec conda run --no-capture-output -n "${conda_env}" \
   --save-top-k 2 \
   --checkpoint-every-n-epochs 5 \
   --periodic-every-n-epochs 0 \
+  --overfit-batches 0 \
   --resume auto \
   "$@"
