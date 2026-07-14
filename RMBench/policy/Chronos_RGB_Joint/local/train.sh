@@ -12,6 +12,9 @@ mkdir -p "${run_root}/Joint_14"
 cd "${repo_root}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONUNBUFFERED=1
+# Batch-2 with three-step gradient accumulation leaves gradients resident.
+# Expandable segments avoid allocator fragmentation between ResNet chunks.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 exec conda run --no-capture-output -n "${conda_env}" \
   python -u RMBench/policy/Chronos_RGB_Joint/train_par_2D_IMLE_Joint.py \
@@ -29,7 +32,7 @@ exec conda run --no-capture-output -n "${conda_env}" \
   --image-width 320 \
   --batch-size 2 \
   --num-workers 0 \
-  --vision-chunk-size 256 \
+  --vision-chunk-size 128 \
   --supervision-frames 0 \
   --precision 32-true \
   --epochs 600 \

@@ -107,7 +107,7 @@ AdamW lr = 1.7e-4, weight_decay = 1e-4
 warmup = 15 epochs, cosine eta_min = 2e-5
 precision = FP32 (official PyTorch defaults: matmul TF32 off, cuDNN TF32 on)
 gradient clip = 1.0
-frozen-image chunk size = 256 frames
+frozen-image chunk size = 128 frames on the local 24 GB GPU
 EMA power = 2/3, max decay = 0.9999
 inference = 5-step semi-implicit Euler
 ```
@@ -129,6 +129,13 @@ environment: RoboTwin
 
 `local/train.sh` passes `--resume none`, so it always starts at epoch 0. To
 resume intentionally, append `--resume /absolute/path/to/last.ckpt`.
+
+The released real-world default is a 256-frame image chunk. The local wrapper
+uses 128 because gradients remain resident across the official three-batch
+accumulation window on a 24 GB GPU. Chunking only partitions the frozen
+ResNet/adapter computation; batch size, loss, optimizer step, effective batch
+and every supervised frame remain unchanged. On a larger GPU, pass
+`--vision-chunk-size 256` to use the released throughput setting.
 
 Training performs held-out offline validation to select the best EMA weights.
 It does not run RMBench closed-loop task evaluation. Closed-loop evaluation is
