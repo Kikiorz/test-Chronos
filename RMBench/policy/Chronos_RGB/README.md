@@ -36,7 +36,9 @@ V1, so the comparison does not simply add a much larger head.
 
 ## Training defaults
 
-The formal defaults are a 50-epoch FP32 fine-tune:
+The formal defaults retain the released Chronos 600-epoch training horizon in
+FP32.  Validation and closed-loop rollouts should still be monitored throughout;
+600 is a maximum horizon, not evidence that the final epoch is the best model:
 
 - batch size 1, full episode history, full timestep supervision;
 - visual adapter LR `1e-4`;
@@ -45,7 +47,8 @@ The formal defaults are a 50-epoch FP32 fine-tune:
 - ResNet stem through layer3 frozen;
 - every ResNet BatchNorm fixed in eval mode with frozen parameters;
 - EMA enabled and deterministic 45/5 episode split with seed 42;
-- best-five, last, and every-10-epoch resumable checkpoints.
+- 15 warm-up epochs;
+- best-five, last, and every-50-epoch resumable checkpoints.
 
 From the repository root:
 
@@ -56,7 +59,7 @@ conda run -n RoboTwin python RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py 
   --batch-size 1 \
   --vision-chunk-size 32 \
   --precision 32-true \
-  --epochs 50
+  --epochs 600
 ```
 
 `--vision-chunk-size 32` is conservative; use `64` when GPU memory permits.
@@ -89,7 +92,7 @@ conda run -n RoboTwin python RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py 
   --warm-start /path/to/v1_epoch60.ckpt \
   --resume none \
   --refit-scaler \
-  --epochs 50 \
+  --epochs 600 \
   --vision-chunk-size 32 \
   --precision 32-true
 ```
@@ -103,7 +106,7 @@ action targets use the new offset.
 
 ## Vast
 
-`vast/train.sh` uses the same 50-epoch FP32 V2 defaults and accepts additional
+`vast/train.sh` uses the same 600-epoch FP32 V2 defaults and accepts additional
 CLI arguments.  Override its paths with:
 
 ```text

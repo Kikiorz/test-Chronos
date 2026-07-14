@@ -223,7 +223,7 @@ class LitMambaRGB(pl.LightningModule):
         visual_head_lr: float = 1e-4,
         backbone_layer4_lr: float = 1e-5,
         weight_decay: float = 1e-4,
-        warmup_epochs: int = 5,
+        warmup_epochs: int = 15,
         eta_min: float = 0.0,
         vision_chunk_size: int = 32,
         supervision_frames: int = 0,
@@ -523,7 +523,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Full history is retained; IMLE/SB loss uses this many timesteps (0 = all valid frames)",
     )
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--accumulate-grad-batches", type=int, default=3)
     parser.add_argument(
         "--learning-rate",
@@ -534,7 +534,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-head-lr", type=float, default=1e-4)
     parser.add_argument("--backbone-layer4-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--warmup-epochs", type=int, default=15)
     parser.add_argument(
         "--eta-min",
         type=float,
@@ -579,7 +579,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--periodic-every",
         type=int,
-        default=10,
+        default=50,
         help="Save a full resumable checkpoint every N epochs (0 disables)",
     )
     parser.add_argument(

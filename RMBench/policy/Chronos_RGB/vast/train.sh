@@ -35,7 +35,8 @@ exec python -u RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py \
   --backbone-layer4-lr 1e-5 \
   --learning-rate 3e-5 \
   --precision 32-true \
-  --epochs 50 \
-  --periodic-every 10 \
+  --epochs 600 \
+  --warmup-epochs 15 \
+  --periodic-every 50 \
   "${resume_args[@]}" \
   "$@"
