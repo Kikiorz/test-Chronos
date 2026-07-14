@@ -1,0 +1,6 @@
+# Runtime artifacts are intentionally kept out of Git/GitHub.
+checkpoints/
+logs/
+lightning_logs/
+*.ckpt
+scaler*.pth

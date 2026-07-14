@@ -1,0 +1,12 @@
+[program:chronos_rgb]
+environment=PROC_NAME="%(program_name)s"
+command=/workspace/Chronos/RMBench/policy/Chronos_RGB/vast/train.sh
+autostart=false
+autorestart=unexpected
+startsecs=5
+stopsignal=INT
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+redirect_stderr=true
+stdout_logfile_maxbytes=0
