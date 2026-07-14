@@ -35,11 +35,11 @@ OBS_KEYS = [
 ]
 ACT_KEYS = [f"{key}_act" for key in OBS_KEYS]
 
-# A frame at index t contains the state observed before the next control
-# command.  Chronos_RGB V2 therefore supervises horizon zero with state t+1,
-# not a copy of the current observation at t.  Keep this contract shared by
-# dataset loading and scaler fitting.
-ACTION_TARGET_OFFSET = 1
+# Match both official Chronos datasets: the action window associated with
+# frame t starts at t and extends through t + future_steps - 1.  RMBench does
+# not store a separate command stream, so its EE observations are reused as
+# action targets, exactly as in M_dataset_robotwin3D_E.py.
+ACTION_TARGET_OFFSET = 0
 
 
 def make_lowdim_dict(future_steps: int = 16) -> Dict[str, object]:
@@ -187,7 +187,7 @@ def _decode_robotwin_rgb(value: object) -> np.ndarray:
 
 
 class RGBTrajectoryDataset(Dataset):
-    """One HDF5 episode per sample, with 16-D EE state and next-state targets.
+    """One HDF5 episode per sample, with 16-D EE state/action windows.
 
     Returns ``image`` as uint8 RGB ``[L,3,H,W]``.  Keeping full trajectories in
     uint8 reduces loader RAM by 4x.  Float conversion and ImageNet normalization
@@ -201,7 +201,7 @@ class RGBTrajectoryDataset(Dataset):
         mode: str = "train",
         future_steps: int = 16,
         scaler: Optional[Scaler] = None,
-        image_hw: Sequence[int] = (240, 320),
+        image_hw: Sequence[int] = (480, 640),
         camera_name: str = "head_camera",
         val_fraction: float = 0.1,
         split_seed: int = 42,
@@ -211,7 +211,7 @@ class RGBTrajectoryDataset(Dataset):
     ):
         super().__init__()
         if future_steps != 16:
-            raise ValueError("Chronos_RGB V2 fixes future_steps=16 for a controlled comparison")
+            raise ValueError("Official RMBench Chronos fixes future_steps=16")
         if len(image_hw) != 2 or min(int(image_hw[0]), int(image_hw[1])) <= 0:
             raise ValueError(f"image_hw must be (height,width), got {image_hw}")
         self.root_dir = Path(root_dir).expanduser().resolve()
@@ -226,8 +226,8 @@ class RGBTrajectoryDataset(Dataset):
         if self.action_target_offset < 0:
             raise ValueError("action_target_offset must be non-negative")
         # Optional short windows exist only for lightweight data diagnostics.
-        # The formal training CLI never enables this: RGB fusion and Mamba see
-        # the full episode, while only expensive head-loss timesteps are sampled.
+        # The formal training CLI never enables this: RGB fusion, Mamba and the
+        # released action loss all see the complete padded episode.
         self.sequence_length = None if sequence_length in (None, 0) else int(sequence_length)
         if self.sequence_length is not None and self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive, zero, or None")
@@ -316,12 +316,12 @@ class RGBTrajectoryDataset(Dataset):
         for frame_index in frame_indices.tolist():
             image = _decode_robotwin_rgb(dataset[frame_index])
             if image.shape[:2] != (target_h, target_w):
-                interpolation = (
-                    cv2.INTER_AREA
-                    if image.shape[0] > target_h or image.shape[1] > target_w
-                    else cv2.INTER_LINEAR
+                # Match real_wolrd training/inference exactly, including its
+                # fixed INTER_AREA choice.  RMBench frames are upsampled from
+                # 320x240 to the encoder's required 640x480 input.
+                image = cv2.resize(
+                    image, (target_w, target_h), interpolation=cv2.INTER_AREA
                 )
-                image = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
             images.append(np.ascontiguousarray(image.transpose(2, 0, 1)))
         image_array = np.stack(images, axis=0)
         return torch.from_numpy(image_array)

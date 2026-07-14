@@ -69,18 +69,17 @@ class MambaRGBController:
         self.temporal_agg = bool(args.get("temporal_agg", True))
         self.temporal_decay = float(args.get("temporal_decay", 0.01))
         self.execution_horizon_offset = int(args.get("execution_horizon_offset", 0))
-        self.visual_architecture = str(args.get("visual_architecture", "v2")).lower()
+        self.visual_architecture = str(
+            args.get("visual_architecture", "official_realworld")
+        ).lower()
         if self.future_steps <= 0 or self.sample_steps <= 0:
             raise ValueError("future_steps and sample_steps must both be positive")
         if self.temporal_decay < 0:
             raise ValueError("temporal_decay must be non-negative")
-        if not 0 <= self.execution_horizon_offset < self.future_steps:
-            raise ValueError(
-                "execution_horizon_offset must be in "
-                f"[0, {self.future_steps - 1}], got {self.execution_horizon_offset}"
-            )
-        if self.visual_architecture not in {"v1", "v2"}:
-            raise ValueError("visual_architecture must be explicitly 'v1' or 'v2'")
+        if self.execution_horizon_offset != 0:
+            raise ValueError("Official RMBench targets require execution_horizon_offset=0")
+        if self.visual_architecture != "official_realworld":
+            raise ValueError("visual_architecture must be 'official_realworld'")
 
         config = MambaConfig()
         config.embed_dim = 1024
@@ -92,9 +91,8 @@ class MambaRGBController:
         config.camera_names = [self.camera_name]
         config.visual_architecture = self.visual_architecture
 
-        # The architecture is explicit and defaults to V2.  Never infer V1
-        # from a checkpoint silently: a V1 checkpoint passed to the V2 default
-        # must fail strict loading unless the diagnostic explicitly selects V1.
+        # The architecture is explicit.  A checkpoint from an older custom
+        # RGB variant must fail strict loading instead of being guessed.
         sys.modules.setdefault("mamba_policy_par_2D_IMLE_EE", mamba_policy_par_2D_IMLE_EE)
         self.ckpt_path = _existing_file(args["ckpt_path"], "RGB checkpoint")
         print(f"[MambaRGBController] Reading checkpoint: {self.ckpt_path}")
@@ -138,7 +136,7 @@ class MambaRGBController:
         del state, checkpoint
         self.policy.eval()
         self.policy.requires_grad_(False)
-        weight_kind = "EMA" if uses_ema else "raw/backward-compatible"
+        weight_kind = "EMA" if uses_ema else "raw"
         print(
             f"[MambaRGBController] Strictly loaded {num_loaded_tensors} "
             f"{weight_kind} policy tensors"

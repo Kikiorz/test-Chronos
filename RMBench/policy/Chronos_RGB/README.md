@@ -1,159 +1,162 @@
-# Chronos_RGB V2 for RMBench
+# Chronos RGB for RMBench
 
-This is the single-head RGB version of Chronos for the RMBench/RoboTwin
-`cover_blocks` simulation:
+This folder trains Chronos on RMBench `cover_blocks` demonstrations using one
+head-camera RGB stream instead of the released point cloud.
 
-- observation: `head_camera` RGB plus dual-arm 16-D EE state;
-- output: 16 future dual-arm 16-D EE targets;
-- execution: `TASK_ENV.take_action(action, action_type="ee")`;
-- default image size: native RMBench 240x320;
-- backbone: ImageNet ResNet18.
+The comparison has an explicit two-part contract:
 
-Data, checkpoints, scalers, evaluation videos, and TensorBoard runs are runtime
-artifacts and must not be committed to Git.
+- RMBench stays authoritative for the 16-D dual-arm EE state/action layout,
+  16-step action horizon, Mamba/action heads, loss and 600-epoch training setup.
+- `real_wolrd` stays authoritative for the RGB preprocessing and visual
+  encoder.  This is the same image front end used by the released real-robot
+  code, with the proprioceptive input adapted from real-world 20D to RMBench
+  16D.
 
-## V2 contract
+Data, scalers, checkpoints, logs and evaluation videos are runtime artifacts
+and must not be committed to Git.
 
-V1 built its target sequence as `[state[t], ..., state[t+15]]`.  Its first
-target merely copied the current observation, while the simulator needed the
-next EE target.  V2 explicitly trains:
+## Exact model and tensor contract
+
+One training sample is a complete episode:
 
 ```text
-observation[t] -> [state[t+1], state[t+2], ..., state[t+16]]
+head RGB:       [L, 3, 480, 640], uint8 on CPU
+EE state:       [L, 16]
+action target:  [L, 16 future steps, 16]
+padding mask:   [L]
 ```
 
-Indices beyond the episode are clamped to its final state.  Scaler fitting uses
-the same shifted targets.  The split manifest records `action_target_offset: 1`.
-At deployment, a V2 checkpoint therefore uses `execution_horizon_offset: 0`.
-The controller retains the offset option only to diagnose a legacy V1
-checkpoint with offset `1` and explicit `visual_architecture=v1`; do not use
-both the V2 target shift and deployment offset `1`.
+The 16-D EE order is:
 
-V2 also preserves the ResNet output's 8x10 spatial grid.  The second adapter
-convolution is stride 1 with 64 channels, followed by an 8x10 pool and a
-256-to-512 projection.  Its total adapter parameter count remains within 2% of
-V1, so the comparison does not simply add a much larger head.
+```text
+left  [x, y, z, qw, qx, qy, qz, gripper]
+right [x, y, z, qw, qx, qy, qz, gripper]
+```
 
-## Training defaults
+Targets match the released RMBench dataset code:
 
-The formal defaults retain the released Chronos 600-epoch training horizon in
-FP32.  Validation and closed-loop rollouts should still be monitored throughout;
-600 is a maximum horizon, not evidence that the final epoch is the best model:
+```text
+observation[t] -> [state[t], state[t+1], ..., state[t+15]]
+```
 
-- batch size 1, full episode history, full timestep supervision;
-- visual adapter LR `1e-4`;
-- ResNet layer4 LR `1e-5`;
-- remaining Chronos/fusion LR `3e-5`;
-- ResNet stem through layer3 frozen;
-- every ResNet BatchNorm fixed in eval mode with frozen parameters;
-- EMA enabled and deterministic 45/5 episode split with seed 42;
-- 15 warm-up epochs;
-- best-five, last, and every-50-epoch resumable checkpoints.
+Indices beyond the episode are clamped to its final state.  The controller
+therefore executes horizon offset 0.  This explicit array offset is different
+from the real-world recorder: its array also starts at index `t`, but the
+recorded target command is scheduled one control cycle into the future.
+
+Low-dimensional state and actions use the official per-key z-score scaler.
+Each action horizon has its own mean/std, `torch.std(dim=0)` uses its default
+sample standard deviation, and the clamp epsilon is `1e-8`.  Statistics are fit
+only on the training episodes.
+
+RMBench writes simulator RGB directly through OpenCV JPEG encoding.  OpenCV
+decode consequently restores the original numeric RGB channels, so the loader
+must not apply another BGR/RGB swap.  Frames are resized to 640x480 with
+`INTER_AREA`, converted to `[0,1]`, and normalized with ImageNet values:
+
+```text
+mean = [0.485, 0.456, 0.406]
+std  = [0.229, 0.224, 0.225]
+```
+
+The visual encoder exactly follows `real_wolrd/common/mamba_policy_par_2D_IMLE.py`:
+
+```text
+RGB [3,480,640]
+-> ImageNet ResNet18 children()[:-2]
+-> replace every BatchNorm2d with GroupNorm(32)
+-> freeze the complete trunk
+-> [512,15,20]
+-> Conv 512->256, GN32, SiLU
+-> Conv 256->128 stride 2, GN16, SiLU
+-> [128,8,10] -> flatten -> Linear 10240->1024
+-> LayerNorm, SiLU, Dropout(0.1)
+```
+
+The 16-D EE state is projected `16->128->512`.  Visual 1024 and EE 512 are
+concatenated, then projected `1536->1024` before the released RMBench Chronos
+temporal/action model.
+
+## Official training settings
+
+The formal run fixes the released RMBench settings:
+
+- seed 42;
+- 600 epochs;
+- batch size 2 and gradient accumulation 3;
+- full episode history and full padded per-frame loss;
+- AdamW, one learning rate `1.7e-4`, weight decay `1e-4`;
+- 15-epoch linear warm-up from 1% LR;
+- cosine schedule with `eta_min=2e-5`;
+- FP32 and gradient clipping 1.0;
+- frozen ResNet18 trunk, trainable visual adapter/fusion and Chronos model;
+- warm-up EMA with maximum decay 0.9999;
+- best five, last, and every-100-epoch resumable checkpoints.
+
+The real-world script itself defaults to 200 epochs and `eta_min=3e-5`; those
+two settings are not used because this is an RMBench experiment.  Both official
+paths otherwise agree on batch 2, accumulation 3, LR `1.7e-4`, weight decay,
+warm-up and FP32.
+
+The official repository README recommends 50 training plus 5 test episodes.
+The current supplied dataset has only 50 flat episodes, so the trainer records
+and uses a deterministic seed-42 45/5 episode holdout.  This is a data
+availability difference, not a hidden hyperparameter change.  If explicit
+`train/` and `test/` directories are later supplied, they take priority.
 
 From the repository root:
 
 ```bash
 conda run -n RoboTwin python RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py \
   --data-root /path/to/cover_blocks/demo_clean/data \
-  --task-name cover_blocks \
-  --batch-size 1 \
-  --vision-chunk-size 32 \
-  --precision 32-true \
-  --epochs 600
+  --output-dir /path/to/run/EE_16_official_rgb \
+  --scaler-path /path/to/run/scaler_cover_blocks_ee_official_rgb.pth \
+  --expected-episodes 50 \
+  --resume none
 ```
 
-`--vision-chunk-size 32` is conservative; use `64` when GPU memory permits.
-Changing the chunk does not shorten Mamba history.  A positive
-`--supervision-frames` samples expensive loss timesteps while retaining full
-history; the formal default `0` supervises every valid frame.
+The command refuses changes to the defining official batch, accumulation,
+resolution, label offset and 600-epoch contract.  `--vision-chunk-size` only
+controls bounded RGB transfer/feature extraction; it does not shorten episode
+history or reduce supervised timesteps.
 
-The V2 artifact defaults are deliberately separate from V1:
+## Vast training
 
-```text
-policy/Chronos_RGB/checkpoints/cover_blocks/EE_16_v2/last.ckpt
-policy/Chronos_RGB/scaler_cover_blocks_ee_rgb_v2.pth
-```
-
-`--resume auto` resumes `last.ckpt` only when it exists in the V2 output
-directory.  Use `--resume none` for an intentional fresh run.  Exact resume
-restores optimizer, scheduler, EMA, and epoch state.
-
-## Warm-start from V1 epoch 60
-
-V1 and V2 share ResNet18, Mamba, proprioception, and action heads.  The V2
-trainer can initialize all shape-compatible policy tensors from a V1 policy or
-Lightning checkpoint:
-
-```bash
-conda run -n RoboTwin python RMBench/policy/Chronos_RGB/train_par_2D_IMLE_EE.py \
-  --data-root /path/to/cover_blocks/demo_clean/data \
-  --output-dir /path/to/new_v2_run/EE_16_v2 \
-  --scaler-path /path/to/new_v2_run/scaler_cover_blocks_ee_rgb_v2.pth \
-  --warm-start /path/to/v1_epoch60.ckpt \
-  --resume none \
-  --refit-scaler \
-  --epochs 600 \
-  --vision-chunk-size 32 \
-  --precision 32-true
-```
-
-Warm-start prefers `ema_policy_state_dict` when present.  It loads every
-same-shaped tensor and prints each changed/new V2 visual tensor left randomly
-initialized.  Missing or mismatched tensors outside the V2 visual adapter are
-a hard error.  `--warm-start` starts a new optimizer run and cannot be combined
-with a resolved `--resume` checkpoint.  Refit/use the V2 scaler because its
-action targets use the new offset.
-
-## Vast
-
-`vast/train.sh` uses the same 600-epoch FP32 V2 defaults and accepts additional
-CLI arguments.  Override its paths with:
+`vast/train.sh` launches the same contract and resumes only a matching
+`last.ckpt`.  It intentionally has no warm-start path.  Runtime paths can be
+set with:
 
 ```text
 CHRONOS_REPO_ROOT
 CHRONOS_VENV_ROOT
 CHRONOS_DATA_ROOT
 CHRONOS_RUN_ROOT
-CHRONOS_V1_WARM_START
 ```
 
-When `CHRONOS_V1_WARM_START` is non-empty and no V2 `last.ckpt` exists, the
-script performs the one-time V1 warm-start and fits the V2 scaler.  Supervisor
-restarts resume the V2 `last.ckpt` instead of starting over.  Checkpoints and
-scalers live below the external run root, not in Git.
-`vast/chronos_rgb.conf.example` can run the script under Supervisor.
+The default remote artifacts are:
+
+```text
+/workspace/chronos_rgb_runs/cover_blocks/EE_16_official_rgb/
+/workspace/chronos_rgb_runs/cover_blocks/scaler_cover_blocks_ee_official_rgb.pth
+```
+
+`run_manifest.json` records the exact split, tensor contract and training
+parameters.  `--resume auto` restores model, raw optimizer state, scheduler and
+EMA state from `last.ckpt`; a fresh run must use `--resume none` and a new/empty
+artifact directory.
 
 ## Evaluation
 
-From `RMBench/`, a V2 one-seed smoke test is:
+From `RMBench/`:
 
 ```bash
-conda activate RoboTwin
-bash policy/Chronos_RGB/eval.sh cover_blocks demo_clean rgb_v2_head_ee16 42 0 1
+bash policy/Chronos_RGB/eval.sh cover_blocks demo_clean official_rgb_head_ee16 42 0 5 \
+  policy/Chronos_RGB/checkpoints/cover_blocks/EE_16_official_rgb/last.ckpt \
+  policy/Chronos_RGB/scaler_cover_blocks_ee_official_rgb.pth
 ```
 
-Arguments seven and eight override checkpoint and scaler.  Argument nine is
-the diagnostic execution offset and argument ten is the visual architecture.
-They must remain `0` and `v2` for V2:
-
-```bash
-bash policy/Chronos_RGB/eval.sh cover_blocks demo_clean my_v2 42 0 5 \
-  policy/Chronos_RGB/checkpoints/my_v2/last.ckpt \
-  policy/Chronos_RGB/scalers/my_v2.pth \
-  0 \
-  v2
-```
-
-Deployment never guesses architecture from a checkpoint: it constructs V2 by
-default and strictly loads the complete state.  Passing a V1 checkpoint to
-that default fails on the changed visual tensors.  The explicit legacy
-diagnostic requires both final arguments `1 v1`; ordinary V2 remains `0 v2`.
-
-```bash
-bash policy/Chronos_RGB/eval.sh cover_blocks demo_clean legacy_v1 42 0 1 \
-  /path/to/v1_epoch60.pth /path/to/v1_scaler.pth 1 v1
-```
-
-`reset_model()` clears Mamba, latent-noise, and temporal-ensemble state at every
-episode.  Temporal voting uses a bounded `16 x 16 x 16` ring and averages
-denormalized physical EE targets.
+Deployment resizes the live head-camera RGB to 480x640, applies the same
+normalization inside the shared fusion module, strictly loads every policy
+tensor, and emits a 16-D EE action through
+`TASK_ENV.take_action(action, action_type="ee")`.  `reset_model()` clears Mamba,
+latent-noise and bounded temporal-ensemble state at every episode.

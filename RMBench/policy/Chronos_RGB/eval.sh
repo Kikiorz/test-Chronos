@@ -2,19 +2,19 @@
 set -euo pipefail
 
 # Usage:
-#   bash policy/Chronos_RGB/eval.sh [task] [config] [setting] [seed] [gpu] [test_num] [ckpt] [scaler] [execution_offset] [visual_architecture]
+#   bash policy/Chronos_RGB/eval.sh [task] [config] [setting] [seed] [gpu] [test_num] [ckpt] [scaler]
 
 policy_name="Chronos_RGB"
 task_name="${1:-cover_blocks}"
 task_config="${2:-demo_clean}"
-ckpt_setting="${3:-rgb_v2_head_ee16}"
+ckpt_setting="${3:-official_rgb_head_ee16}"
 seed="${4:-42}"
 physical_gpu_id="${5:-0}"
 test_num="${6:-5}"
-ckpt_path="${7:-policy/Chronos_RGB/checkpoints/${task_name}/EE_16_v2/last.ckpt}"
-scaler_path="${8:-policy/Chronos_RGB/scaler_${task_name}_ee_rgb_v2.pth}"
-execution_horizon_offset="${9:-0}"
-visual_architecture="${10:-v2}"
+ckpt_path="${7:-policy/Chronos_RGB/checkpoints/${task_name}/EE_16_official_rgb/last.ckpt}"
+scaler_path="${8:-policy/Chronos_RGB/scaler_${task_name}_ee_official_rgb.pth}"
+execution_horizon_offset=0
+visual_architecture="official_realworld"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 rmbench_root="$(cd -- "${script_dir}/../.." && pwd)"

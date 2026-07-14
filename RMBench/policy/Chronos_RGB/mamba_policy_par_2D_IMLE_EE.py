@@ -36,7 +36,7 @@ else:  # pragma: no cover - exercised by the training/deployment entrypoints
 
 
 class MambaConfig(_PointCloudMambaConfig):
-    """RMBench RGB V2 defaults: one RGB camera and 16-D EE control."""
+    """Official real-world RGB encoder with RMBench's 16-D EE interface."""
 
     def __init__(self):
         super().__init__()
@@ -48,18 +48,23 @@ class MambaConfig(_PointCloudMambaConfig):
         self.future_steps = 16
         self.num_blocks = 6
         self.pretrained_backbone = True
-        self.visual_architecture = "v2"
-        # V2 adapts the semantic ResNet stage gently while keeping the lower
-        # ImageNet features fixed.  BatchNorm is frozen in every stage.
-        self.backbone_trainable = "layer4"
+        self.visual_architecture = "official_realworld"
+        self.backbone_trainable = "none"
 
 
 class ImageMambaFusion(nn.Module):
-    """Partially adapted ResNet18 plus spatial/proprioceptive fusion.
+    """The repository's official real-world ``ImageMambaFusion`` contract.
 
-    The adaptive pool keeps the module independent of a hard-coded camera
-    resolution.  RMBench's native 240x320 images are used without an upsample.
-    Inputs may be NCHW or NHWC and either uint8/[0,255] or float/[0,1].
+    The train and deployment paths both pass raw RGB to this module.  Keeping
+    ImageNet normalization here makes the two paths mathematically identical:
+    training may use uint8 ``[0, 255]`` and deployment may use float ``[0, 1]``.
+    The official flatten projector fixes the input at 480x640; the ResNet trunk
+    then produces 15x20 and the stride-2 adapter produces 8x10.
+
+    ``backbone_trainable``, ``freeze_backbone``, ``visual_architecture`` and
+    ``spatial_pool`` are accepted only so older controller/trainer call sites
+    can construct a fresh official model.  They cannot enable a legacy V1/V2
+    branch or unfreeze any part of the ResNet trunk.
     """
 
     _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -70,9 +75,9 @@ class ImageMambaFusion(nn.Module):
         embed_dim: int = 1024,
         proprio_dim: int = 16,
         pretrained: bool = True,
-        backbone_trainable: str = "layer4",
+        backbone_trainable: str | None = None,
         freeze_backbone: bool | None = None,
-        visual_architecture: str = "v2",
+        visual_architecture: str | None = None,
         spatial_pool: Sequence[int] | None = None,
     ):
         super().__init__()
@@ -83,77 +88,52 @@ class ImageMambaFusion(nn.Module):
             )
         self.embed_dim = int(embed_dim)
         self.proprio_dim = int(proprio_dim)
-        # ``freeze_backbone`` remains a compatibility bridge for V1 call
-        # sites/checkpoints.  New training code uses the explicit stage name.
-        if freeze_backbone is not None:
-            backbone_trainable = "none" if freeze_backbone else "all"
-        self.backbone_trainable = str(backbone_trainable).lower()
-        if self.backbone_trainable not in {"none", "layer4", "all"}:
+        if self.proprio_dim != 16:
             raise ValueError(
-                "backbone_trainable must be one of: none, layer4, all; "
-                f"got {backbone_trainable!r}"
+                "The RMBench RGB policy requires a 16-D dual-arm EE state; "
+                f"got proprio_dim={self.proprio_dim}."
             )
-        self.freeze_backbone = self.backbone_trainable == "none"
-        self.visual_architecture = str(visual_architecture).lower()
-        if self.visual_architecture not in {"v1", "v2"}:
-            raise ValueError(
-                f"visual_architecture must be 'v1' or 'v2', got {visual_architecture!r}"
-            )
+
+        # Backward-compatible constructor surface only.  The fresh checkpoint
+        # has one architecture and its ImageNet trunk is always frozen.
+        del backbone_trainable, freeze_backbone, visual_architecture, spatial_pool
+        self.backbone_trainable = "none"
+        self.freeze_backbone = True
+        self.visual_architecture = "official_realworld"
 
         if hasattr(models, "ResNet18_Weights"):
             weights = models.ResNet18_Weights.DEFAULT if pretrained else None
             resnet = models.resnet18(weights=weights)
         else:  # torchvision < 0.13
             resnet = models.resnet18(pretrained=pretrained)
-        self.vision_backbone = nn.Sequential(*list(resnet.children())[:-2])
-        self._configure_backbone_trainability()
+        self.vision_net = nn.Sequential(*list(resnet.children())[:-2])
+        self._replace_bn_with_gn(self.vision_net)
+        self.vision_net.requires_grad_(False)
+        self.vision_net.eval()
 
-        if spatial_pool is None:
-            spatial_pool = (4, 5) if self.visual_architecture == "v1" else (8, 10)
-        pool_h, pool_w = (int(spatial_pool[0]), int(spatial_pool[1]))
-        if self.visual_architecture == "v1":
-            # Kept only so released V1 checkpoints remain strictly loadable for
-            # the execution_horizon_offset=1 diagnostic.
-            self.visual_adapter = nn.Sequential(
-                nn.Conv2d(512, 256, kernel_size=3, padding=1),
-                nn.GroupNorm(32, 256),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),
-                nn.GroupNorm(16, 128),
-                nn.SiLU(inplace=True),
-                nn.AdaptiveAvgPool2d((pool_h, pool_w)),
-                nn.Flatten(1),
-                nn.Linear(128 * pool_h * pool_w, 512),
-                nn.LayerNorm(512),
-                nn.SiLU(inplace=True),
-            )
-        else:
-            self.visual_adapter = nn.Sequential(
-                nn.Conv2d(512, 256, kernel_size=3, padding=1),
-                nn.GroupNorm(32, 256),
-                nn.SiLU(inplace=True),
-                # ResNet's native 240x320 feature map is already 8x10.  V1
-                # unnecessarily reduced it to 4x5 here; V2 preserves that
-                # spatial grid and halves channels to hold the parameter budget.
-                nn.Conv2d(256, 64, kernel_size=3, stride=1, padding=1),
-                nn.GroupNorm(16, 64),
-                nn.SiLU(inplace=True),
-                nn.AdaptiveAvgPool2d((pool_h, pool_w)),
-                nn.Flatten(1),
-                nn.Linear(64 * pool_h * pool_w, 256),
-                nn.LayerNorm(256),
-                nn.SiLU(inplace=True),
-                nn.Linear(256, 512),
-                nn.LayerNorm(512),
-                nn.SiLU(inplace=True),
-            )
+        self.visual_adapter = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(32, 256),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(16, 128),
+            nn.SiLU(inplace=True),
+            nn.Flatten(1),
+            nn.Linear(128 * 8 * 10, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(0.10),
+        )
         self.proprio_projector = nn.Sequential(
             nn.Linear(self.proprio_dim, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 512),
             nn.LayerNorm(512),
         )
-        self.fusion_norm = nn.LayerNorm(1024)
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(self.embed_dim + 512, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        )
 
         self.register_buffer(
             "image_mean", torch.tensor(self._IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False
@@ -162,49 +142,51 @@ class ImageMambaFusion(nn.Module):
             "image_std", torch.tensor(self._IMAGENET_STD).view(1, 3, 1, 1), persistent=False
         )
 
-    @staticmethod
-    def _freeze_batch_norm(module: nn.Module) -> None:
-        for child in module.modules():
-            if isinstance(child, nn.modules.batchnorm._BatchNorm):
-                child.eval()
-                child.requires_grad_(False)
+    @property
+    def vision_backbone(self) -> nn.Sequential:
+        """Read-only alias for older trainer diagnostics (not a state key)."""
 
-    def _configure_backbone_trainability(self) -> None:
-        self.vision_backbone.requires_grad_(False)
-        if self.backbone_trainable == "layer4":
-            # torchvision ResNet children[:-2] ends with layer4 at index 7.
-            self.vision_backbone[7].requires_grad_(True)
-        elif self.backbone_trainable == "all":
-            self.vision_backbone.requires_grad_(True)
-        self._freeze_batch_norm(self.vision_backbone)
+        return self.vision_net
+
+    def _replace_bn_with_gn(self, module: nn.Module) -> None:
+        for name, child in module.named_children():
+            if isinstance(child, nn.BatchNorm2d):
+                setattr(
+                    module,
+                    name,
+                    nn.GroupNorm(num_groups=32, num_channels=child.num_features),
+                )
+            else:
+                self._replace_bn_with_gn(child)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.backbone_trainable == "none":
-            self.vision_backbone.eval()
-        elif self.backbone_trainable == "layer4":
-            # Frozen stages stay in inference mode; only layer4's convolutions
-            # train.  All of its BatchNorm layers are reset to eval below.
-            for stage in list(self.vision_backbone.children())[:-1]:
-                stage.eval()
-            self.vision_backbone[7].train(mode)
-        self._freeze_batch_norm(self.vision_backbone)
+        # The official real-world code extracts ResNet features under no_grad.
+        # Explicitly pinning the trunk to eval also makes that guarantee robust
+        # when Lightning recursively calls policy.train().
+        self.vision_net.eval()
         return self
 
     def _prepare_image(self, image: torch.Tensor) -> torch.Tensor:
-        if image.ndim != 4:
-            raise ValueError(f"Expected a 4-D image batch, got shape={tuple(image.shape)}")
-        if image.shape[1] != 3 and image.shape[-1] == 3:
-            image = image.permute(0, 3, 1, 2)
-        if image.shape[1] != 3:
-            raise ValueError(f"Expected three RGB channels, got shape={tuple(image.shape)}")
-
-        integer_input = not image.is_floating_point()
-        image = image.to(dtype=self.image_mean.dtype)
-        # Training uses uint8, which avoids a GPU max/synchronization per
-        # chunk.  Deployment may supply either [0,1] or float [0,255].
-        if integer_input or (image.numel() and image.detach().amax() > 1.5):
-            image = image / 255.0
+        if image.ndim != 4 or tuple(image.shape[1:]) != (3, 480, 640):
+            raise ValueError(
+                "Expected NCHW RGB at the official 480x640 resolution, "
+                f"got shape={tuple(image.shape)}"
+            )
+        if image.shape[0] == 0:
+            raise ValueError("The image batch must contain at least one frame")
+        if image.dtype == torch.uint8:
+            # uint8 already guarantees [0,255].  Avoid a GPU min/max
+            # synchronization for every training chunk.
+            image = image.to(dtype=self.image_mean.dtype) / 255.0
+        elif image.is_floating_point():
+            image = image.to(dtype=self.image_mean.dtype)
+            if not torch.isfinite(image).all():
+                raise ValueError("RGB input contains NaN or infinity")
+            if image.amin() < 0 or image.amax() > 1:
+                raise ValueError("Floating-point RGB input must already be in [0, 1]")
+        else:
+            raise TypeError("Integer RGB input must use torch.uint8")
         return (image - self.image_mean) / self.image_std
 
     def forward(self, image: torch.Tensor, proprio_embed: torch.Tensor) -> torch.Tensor:
@@ -214,25 +196,20 @@ class ImageMambaFusion(nn.Module):
                 f"got {tuple(proprio_embed.shape)}"
             )
         image = self._prepare_image(image)
-        if self.backbone_trainable == "none":
-            with torch.no_grad():
-                feature_map = self.vision_backbone(image)
-        elif self.backbone_trainable == "layer4":
-            # Do not retain activations for the frozen stem through layer3.
-            with torch.no_grad():
-                feature_map = image
-                for stage in list(self.vision_backbone.children())[:-1]:
-                    feature_map = stage(feature_map)
-            feature_map = self.vision_backbone[7](feature_map)
-        else:
-            feature_map = self.vision_backbone(image)
+        with torch.no_grad():
+            feature_map = self.vision_net(image)
+        if tuple(feature_map.shape[1:]) != (512, 15, 20):
+            raise RuntimeError(
+                "Official RGB trunk must produce [N,512,15,20] before the "
+                f"8x10 visual adapter, got {tuple(feature_map.shape)}"
+            )
         visual_feature = self.visual_adapter(feature_map)
         proprio_feature = self.proprio_projector(proprio_embed)
-        return self.fusion_norm(torch.cat([visual_feature, proprio_feature], dim=-1))
+        return self.fusion_proj(torch.cat([visual_feature, proprio_feature], dim=-1))
 
 
 class MambaPolicy(_PointCloudMambaPolicy):
-    """Original Chronos policy with only ``fusion_engine`` replaced by RGB."""
+    """Original RMBench Chronos dynamics with the official RGB fusion engine."""
 
     def __init__(
         self,
@@ -252,16 +229,16 @@ class MambaPolicy(_PointCloudMambaPolicy):
     ):
         if list(camera_names) != ["head_camera"]:
             raise ValueError(
-                "Chronos_RGB V2 intentionally uses exactly one camera: ['head_camera']; "
+                "Chronos_RGB intentionally uses exactly one camera: ['head_camera']; "
                 f"got {list(camera_names)}"
             )
         if lowdim_dim != 16 or action_dim != 16 or future_steps != 16:
             raise ValueError(
-                "Chronos_RGB V2 is the controlled RGB-vs-point-cloud experiment and "
+                "Chronos_RGB is the controlled RGB-vs-point-cloud experiment and "
                 "therefore requires lowdim_dim=16, action_dim=16, future_steps=16."
             )
         if embed_dim != 1024 or d_model != 1024:
-            raise ValueError("Chronos_RGB V2 requires embed_dim=d_model=1024.")
+            raise ValueError("Chronos_RGB requires embed_dim=d_model=1024.")
 
         cfg = mamba_cfg if mamba_cfg is not None else MambaConfig()
         super().__init__(
@@ -278,9 +255,11 @@ class MambaPolicy(_PointCloudMambaPolicy):
         if pretrained_backbone is None:
             pretrained_backbone = bool(getattr(cfg, "pretrained_backbone", True))
         if backbone_trainable is None:
-            backbone_trainable = str(getattr(cfg, "backbone_trainable", "layer4"))
+            backbone_trainable = str(getattr(cfg, "backbone_trainable", "none"))
         if visual_architecture is None:
-            visual_architecture = str(getattr(cfg, "visual_architecture", "v2"))
+            visual_architecture = str(
+                getattr(cfg, "visual_architecture", "official_realworld")
+            )
         self.fusion_engine = ImageMambaFusion(
             embed_dim=embed_dim,
             proprio_dim=lowdim_dim,

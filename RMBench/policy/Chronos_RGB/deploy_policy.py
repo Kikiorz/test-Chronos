@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+import cv2
 import numpy as np
 import torch
 
@@ -39,13 +40,21 @@ def _extract_head_rgb(observation: Mapping[str, Any], camera_name: str) -> np.nd
 
     # SAPIEN/RoboTwin already returns RGB (not OpenCV BGR), so there is no
     # red/blue channel swap here.
-    image = image.astype(np.float32, copy=False)
-    if image.size and float(np.nanmax(image)) > 1.5:
-        image = image / 255.0
-    if not np.isfinite(image).all():
+    image_float = image.astype(np.float32, copy=False)
+    if not np.isfinite(image_float).all():
         raise ValueError("RGB image contains NaN or infinity")
-    image = np.clip(image, 0.0, 1.0)
-    return image
+    if image_float.size and float(image_float.max()) <= 1.5:
+        # Match RMBench camera.py: (rgb * 255).clip(...).astype(uint8).
+        image_uint8 = (image_float * 255.0).clip(0.0, 255.0).astype(np.uint8)
+    else:
+        image_uint8 = image_float.clip(0.0, 255.0).astype(np.uint8)
+    if image_uint8.shape[:2] != (480, 640):
+        # The official real-world encoder has a hard-coded 8x10 flatten head.
+        # Resize uint8 before scaling, exactly like the offline loader.
+        image_uint8 = cv2.resize(
+            image_uint8, (640, 480), interpolation=cv2.INTER_AREA
+        )
+    return image_uint8.astype(np.float32) / 255.0
 
 
 def _as_scalar(value: Any, name: str) -> float:
@@ -114,7 +123,9 @@ def get_model(usr_args: Mapping[str, Any]) -> MambaRGBController:
         "temporal_agg": bool(usr_args.get("temporal_agg", True)),
         "temporal_decay": float(usr_args.get("temporal_decay", 0.01)),
         "execution_horizon_offset": int(usr_args.get("execution_horizon_offset", 0)),
-        "visual_architecture": str(usr_args.get("visual_architecture", "v2")),
+        "visual_architecture": str(
+            usr_args.get("visual_architecture", "official_realworld")
+        ),
     }
     return MambaRGBController(controller_args)
 

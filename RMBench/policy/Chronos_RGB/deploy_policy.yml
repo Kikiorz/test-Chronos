@@ -2,23 +2,21 @@
 policy_name: Chronos_RGB
 task_name: null
 task_config: null
-ckpt_setting: rgb_v2_head_ee16
+ckpt_setting: official_rgb_head_ee16
 seed: 42
 instruction_type: unseen
 
 # Paths are resolved from RMBench/ by script/eval_policy.py.
-ckpt_path: policy/Chronos_RGB/checkpoints/cover_blocks/EE_16_v2/last.ckpt
-scaler_path: policy/Chronos_RGB/scaler_cover_blocks_ee_rgb_v2.pth
+ckpt_path: policy/Chronos_RGB/checkpoints/cover_blocks/EE_16_official_rgb/last.ckpt
+scaler_path: policy/Chronos_RGB/scaler_cover_blocks_ee_official_rgb.pth
 
 camera_name: head_camera
 future_steps: 16
 sample_steps: 5
 temporal_agg: true
 temporal_decay: 0.01
-# V2 target horizon zero is the next recorded state, so execute offset 0.
-# Legacy V1 checkpoints can still be diagnosed with 1.
+# Official RMBench targets begin at the same recorded timestep.
 execution_horizon_offset: 0
-# V1 diagnostics must explicitly override this together with execution offset 1.
-visual_architecture: v2
+visual_architecture: official_realworld
 device: auto
 gpu_id: 0

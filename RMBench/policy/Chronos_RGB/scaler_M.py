@@ -15,7 +15,7 @@ Shape = Union[int, tuple[int, ...]]
 class Scaler(nn.Module):
     """Per-key z-score normalization with statistics stored in ``state_dict``."""
 
-    def __init__(self, lowdim_dict: Mapping[str, Shape], eps: float = 1e-6):
+    def __init__(self, lowdim_dict: Mapping[str, Shape], eps: float = 1e-8):
         super().__init__()
         self.lowdim_dict = dict(lowdim_dict)
         self.eps = float(eps)
@@ -43,8 +43,10 @@ class Scaler(nn.Module):
             if data.ndim == 0 or data.shape[0] < 1:
                 raise ValueError(f"Scaler key {key!r} has no samples: shape={tuple(data.shape)}")
             mean = data.mean(dim=0)
-            # unbiased=False also works for a one-frame smoke-test episode.
-            std = data.std(dim=0, unbiased=False).clamp_min(self.eps)
+            # Keep the official Chronos convention: torch.std's default
+            # unbiased=True, with every non-sample dimension (including each
+            # action-horizon slot) retaining its own statistic.
+            std = data.std(dim=0).clamp_min(self.eps)
             expected_shape = self.mean_dict[key].shape
             if mean.shape != expected_shape:
                 raise ValueError(

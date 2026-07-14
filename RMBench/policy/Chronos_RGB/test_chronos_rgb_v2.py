@@ -1,4 +1,4 @@
-"""Focused contract tests for the Chronos_RGB V2 changes.
+"""Focused contracts for the official real-world Chronos RGB encoder.
 
 Run without pytest:
     python -m unittest RMBench.policy.Chronos_RGB.test_chronos_rgb_v2
@@ -14,23 +14,19 @@ from torch import nn
 
 from .M_dataset_robotwinRGB_E import ACTION_TARGET_OFFSET, make_future_action_targets
 from .mamba_policy_par_2D_IMLE_EE import ImageMambaFusion, MambaConfig
-from .train_par_2D_IMLE_EE import (
-    load_compatible_policy_state,
-    make_optimizer_parameter_groups,
-)
 
 
 class FutureTargetContractTest(unittest.TestCase):
-    def test_next_state_offset_and_tail_clamp(self) -> None:
+    def test_same_step_offset_and_tail_clamp(self) -> None:
         trajectory = np.arange(4, dtype=np.float32)[:, None]
         actual = make_future_action_targets(
             trajectory, future_steps=3, target_offset=ACTION_TARGET_OFFSET
         )
         expected = np.array(
             [
+                [[0.0], [1.0], [2.0]],
                 [[1.0], [2.0], [3.0]],
                 [[2.0], [3.0], [3.0]],
-                [[3.0], [3.0], [3.0]],
                 [[3.0], [3.0], [3.0]],
             ],
             dtype=np.float32,
@@ -54,132 +50,107 @@ class FutureTargetContractTest(unittest.TestCase):
 
 class VisualBackboneContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.fusion = ImageMambaFusion(pretrained=False, backbone_trainable="layer4")
+        self.fusion = ImageMambaFusion(pretrained=False)
 
-    def test_v2_adapter_preserves_eight_by_ten_budget(self) -> None:
-        self.assertEqual(MambaConfig().visual_architecture, "v2")
-        second_conv = self.fusion.visual_adapter[3]
-        self.assertEqual(second_conv.out_channels, 64)
-        self.assertEqual(second_conv.stride, (1, 1))
-        self.assertEqual(self.fusion.visual_adapter[6].output_size, (8, 10))
-        self.assertEqual(self.fusion.visual_adapter[8].in_features, 64 * 8 * 10)
-        self.assertEqual(self.fusion.visual_adapter[8].out_features, 256)
-        self.assertEqual(self.fusion.visual_adapter[11].out_features, 512)
+    def test_config_selects_only_the_official_frozen_encoder(self) -> None:
+        config = MambaConfig()
+        self.assertEqual(config.visual_architecture, "official_realworld")
+        self.assertEqual(config.backbone_trainable, "none")
+        self.assertEqual(config.lowdim_dim, 16)
+        self.assertEqual(config.action_dim, 16)
+        self.assertEqual(config.future_steps, 16)
 
-        v2_parameters = sum(parameter.numel() for parameter in self.fusion.visual_adapter.parameters())
-        v1_parameters = 2_787_968
-        self.assertLess(abs(v2_parameters - v1_parameters) / v1_parameters, 0.02)
-
-    def test_visual_architecture_strict_load_matrix(self) -> None:
-        v1_source = ImageMambaFusion(
-            pretrained=False, backbone_trainable="none", visual_architecture="v1"
-        )
-        with self.assertRaises(RuntimeError):
-            self.fusion.load_state_dict(v1_source.state_dict(), strict=True)
-
-        explicit_v1_target = ImageMambaFusion(
-            pretrained=False, backbone_trainable="none", visual_architecture="v1"
-        )
-        explicit_v1_target.load_state_dict(v1_source.state_dict(), strict=True)
-
-        v2_source = ImageMambaFusion(
-            pretrained=False, backbone_trainable="none", visual_architecture="v2"
-        )
-        v2_target = ImageMambaFusion(
-            pretrained=False, backbone_trainable="none", visual_architecture="v2"
-        )
-        v2_target.load_state_dict(v2_source.state_dict(), strict=True)
-
-    def test_only_layer4_non_bn_parameters_train(self) -> None:
-        for stage in list(self.fusion.vision_backbone.children())[:-1]:
-            self.assertTrue(all(not parameter.requires_grad for parameter in stage.parameters()))
-
-        trainable_layer4 = [
-            parameter
-            for name, parameter in self.fusion.vision_backbone[7].named_parameters()
-            if "bn" not in name and "downsample.1" not in name
-        ]
-        self.assertTrue(trainable_layer4)
-        self.assertTrue(all(parameter.requires_grad for parameter in trainable_layer4))
-
-        self.fusion.train()
+    def test_recursive_bn_to_gn_and_whole_trunk_is_frozen_eval(self) -> None:
         batch_norms = [
             module
-            for module in self.fusion.vision_backbone.modules()
+            for module in self.fusion.vision_net.modules()
             if isinstance(module, nn.modules.batchnorm._BatchNorm)
         ]
-        self.assertTrue(batch_norms)
-        self.assertTrue(all(not module.training for module in batch_norms))
-        self.assertTrue(
-            all(not parameter.requires_grad for module in batch_norms for parameter in module.parameters())
+        group_norms = [
+            module for module in self.fusion.vision_net.modules() if isinstance(module, nn.GroupNorm)
+        ]
+        self.assertEqual(batch_norms, [])
+        self.assertTrue(group_norms)
+        self.assertTrue(all(module.num_groups == 32 for module in group_norms))
+        self.assertTrue(all(not parameter.requires_grad for parameter in self.fusion.vision_net.parameters()))
+
+        self.fusion.train()
+        self.assertTrue(self.fusion.training)
+        self.assertFalse(self.fusion.vision_net.training)
+        self.assertTrue(self.fusion.visual_adapter.training)
+        self.assertTrue(all(not module.training for module in self.fusion.vision_net.modules()))
+
+    def test_legacy_arguments_cannot_select_v1_v2_or_unfreeze_layer4(self) -> None:
+        fusion = ImageMambaFusion(
+            pretrained=False,
+            backbone_trainable="all",
+            freeze_backbone=False,
+            visual_architecture="v1",
+            spatial_pool=(4, 5),
         )
+        self.assertEqual(fusion.visual_architecture, "official_realworld")
+        self.assertEqual(fusion.backbone_trainable, "none")
+        self.assertTrue(fusion.freeze_backbone)
+        self.assertTrue(all(not parameter.requires_grad for parameter in fusion.vision_net.parameters()))
 
-    def test_optimizer_groups_are_complete_and_disjoint(self) -> None:
-        class TinyPolicy(nn.Module):
-            def __init__(self, fusion: ImageMambaFusion):
-                super().__init__()
-                self.fusion_engine = fusion
-                self.temporal = nn.Linear(4, 4)
+    def test_official_adapter_proprio_and_fusion_parameter_shapes(self) -> None:
+        adapter = self.fusion.visual_adapter
+        self.assertEqual(adapter[0].weight.shape, (256, 512, 3, 3))
+        self.assertEqual(adapter[1].num_groups, 32)
+        self.assertEqual(adapter[3].weight.shape, (128, 256, 3, 3))
+        self.assertEqual(adapter[3].stride, (2, 2))
+        self.assertEqual(adapter[4].num_groups, 16)
+        self.assertIsInstance(adapter[6], nn.Flatten)
+        self.assertEqual(adapter[7].weight.shape, (1024, 128 * 8 * 10))
+        self.assertEqual(adapter[8].normalized_shape, (1024,))
+        self.assertIsInstance(adapter[9], nn.SiLU)
+        self.assertEqual(adapter[10].p, 0.10)
 
-        policy = TinyPolicy(self.fusion)
-        groups = make_optimizer_parameter_groups(policy, 1e-4, 1e-5, 3e-5)
-        self.assertEqual([group["name"] for group in groups], [
-            "visual_head", "resnet_layer4", "chronos"
-        ])
-        self.assertEqual([group["lr"] for group in groups], [1e-4, 1e-5, 3e-5])
-        grouped_ids = [id(parameter) for group in groups for parameter in group["params"]]
-        expected_ids = [id(parameter) for parameter in policy.parameters() if parameter.requires_grad]
-        self.assertEqual(len(grouped_ids), len(set(grouped_ids)))
-        self.assertEqual(set(grouped_ids), set(expected_ids))
+        proprio = self.fusion.proprio_projector
+        self.assertEqual(proprio[0].weight.shape, (128, 16))
+        self.assertEqual(proprio[2].weight.shape, (512, 128))
+        self.assertEqual(proprio[3].normalized_shape, (512,))
+        self.assertEqual(self.fusion.fusion_proj[0].weight.shape, (1024, 1536))
+        self.assertEqual(self.fusion.fusion_proj[1].normalized_shape, (1024,))
 
+    def test_uint8_and_unit_float_normalization_are_identical(self) -> None:
+        raw = torch.randint(0, 256, (1, 3, 480, 640), dtype=torch.uint8)
+        unit_float = raw.float() / 255.0
+        actual_uint8 = self.fusion._prepare_image(raw)
+        actual_float = self.fusion._prepare_image(unit_float)
+        manual = (unit_float - self.fusion.image_mean) / self.fusion.image_std
+        torch.testing.assert_close(actual_uint8, actual_float, rtol=0, atol=0)
+        torch.testing.assert_close(actual_uint8, manual, rtol=0, atol=0)
 
-class WarmStartContractTest(unittest.TestCase):
-    @staticmethod
-    def _policy() -> nn.Module:
-        class Fusion(nn.Module):
-            def __init__(self):
-                super().__init__()
-                layers: list[nn.Module] = [nn.Identity() for _ in range(13)]
-                layers[3] = nn.Linear(2, 2)
-                layers[11] = nn.Linear(2, 2)
-                layers[12] = nn.LayerNorm(2)
-                self.visual_adapter = nn.Sequential(*layers)
+    def test_strict_image_shape_and_range(self) -> None:
+        with self.assertRaisesRegex(ValueError, "480x640"):
+            self.fusion._prepare_image(torch.zeros(1, 3, 240, 320))
+        with self.assertRaisesRegex(ValueError, "480x640"):
+            self.fusion._prepare_image(torch.zeros(1, 480, 640, 3))
+        with self.assertRaisesRegex(ValueError, r"\[0, 1\]"):
+            self.fusion._prepare_image(torch.full((1, 3, 480, 640), 2.0))
 
-        class Policy(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fusion_engine = Fusion()
-                self.temporal = nn.Linear(2, 2)
-
-        return Policy()
-
-    def test_loads_all_compatible_and_only_skips_changed_visual_head(self) -> None:
-        policy = self._policy()
-        source = {key: value.clone() for key, value in policy.state_dict().items()}
-        source.pop("fusion_engine.visual_adapter.11.weight")
-        source.pop("fusion_engine.visual_adapter.11.bias")
-        source.pop("fusion_engine.visual_adapter.12.weight")
-        source.pop("fusion_engine.visual_adapter.12.bias")
-        source["fusion_engine.visual_adapter.3.weight"] = torch.zeros(3, 2)
-        source["fusion_engine.visual_adapter.3.bias"] = torch.zeros(3)
-        source["temporal.weight"].fill_(4.0)
-
-        report = load_compatible_policy_state(policy, source)
-        self.assertIn("fusion_engine.visual_adapter.3.weight", report["skipped_shape"])
-        self.assertEqual(set(report["initialized_v2"]), {
-            "fusion_engine.visual_adapter.11.weight",
-            "fusion_engine.visual_adapter.11.bias",
-            "fusion_engine.visual_adapter.12.weight",
-            "fusion_engine.visual_adapter.12.bias",
-        })
-        torch.testing.assert_close(policy.temporal.weight, torch.full_like(policy.temporal.weight, 4.0))
-
-    def test_rejects_shape_mismatch_outside_visual_head(self) -> None:
-        policy = self._policy()
-        source = {key: value.clone() for key, value in policy.state_dict().items()}
-        source["temporal.weight"] = torch.zeros(3, 2)
-        with self.assertRaisesRegex(RuntimeError, "outside the expected V1-to-V2 visual changes"):
-            load_compatible_policy_state(policy, source)
+    def test_forward_uses_15x20_to_8x10_and_returns_1024(self) -> None:
+        trunk_shapes: list[tuple[int, ...]] = []
+        adapter_shapes: list[tuple[int, ...]] = []
+        trunk_hook = self.fusion.vision_net.register_forward_hook(
+            lambda _module, _inputs, output: trunk_shapes.append(tuple(output.shape))
+        )
+        adapter_hook = self.fusion.visual_adapter[3].register_forward_hook(
+            lambda _module, _inputs, output: adapter_shapes.append(tuple(output.shape))
+        )
+        try:
+            self.fusion.eval()
+            output = self.fusion(
+                torch.zeros(1, 3, 480, 640, dtype=torch.uint8),
+                torch.zeros(1, 16),
+            )
+        finally:
+            trunk_hook.remove()
+            adapter_hook.remove()
+        self.assertEqual(trunk_shapes, [(1, 512, 15, 20)])
+        self.assertEqual(adapter_shapes, [(1, 128, 8, 10)])
+        self.assertEqual(output.shape, (1, 1024))
 
 
 if __name__ == "__main__":

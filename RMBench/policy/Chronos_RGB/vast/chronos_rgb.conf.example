@@ -1,6 +1,6 @@
 [program:chronos_rgb]
-environment=PROC_NAME="%(program_name)s"
-command=/workspace/Chronos/RMBench/policy/Chronos_RGB/vast/train.sh
+environment=PROC_NAME="%(program_name)s",CHRONOS_REPO_ROOT="/workspace/test-Chronos",CHRONOS_VENV_ROOT="/workspace/.venvs/chronos-rgb",CHRONOS_DATA_ROOT="/workspace/datasets/rmbench_rgb/cover_blocks/demo_clean/data",CHRONOS_RUN_ROOT="/workspace/chronos_rgb_runs/cover_blocks"
+command=/workspace/test-Chronos/RMBench/policy/Chronos_RGB/vast/train.sh
 autostart=false
 autorestart=unexpected
 startsecs=5
