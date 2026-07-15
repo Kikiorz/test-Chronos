@@ -159,4 +159,7 @@ Deployment resizes the live head-camera RGB to 480x640, applies the same
 normalization inside the shared fusion module, strictly loads every policy
 tensor, and emits a 16-D EE action through
 `TASK_ENV.take_action(action, action_type="ee")`.  `reset_model()` clears Mamba,
-latent-noise and bounded temporal-ensemble state at every episode.
+latent-noise and bounded temporal-ensemble state at every episode.  As in the
+released RMBench point-cloud and real-world controllers, temporal ensembling is
+performed in normalized action space and the selected current action is then
+denormalized with the horizon-zero statistics.

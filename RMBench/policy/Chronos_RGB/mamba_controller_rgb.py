@@ -142,7 +142,9 @@ class MambaRGBController:
             f"{weight_kind} policy tensors"
         )
 
-        # Q x Q x D, where Q=future_steps.  This replaces the original
+        # Q x Q x D, where Q=future_steps.  Values stay in the policy's
+        # normalized action space, matching both released Chronos controllers.
+        # This replaces the original
         # 5000 x (5000+Q) x D allocation while retaining every sequence that
         # can still vote for the current action.
         self._action_ring = torch.empty(
@@ -185,8 +187,27 @@ class MambaRGBController:
         denormalized = self.scaler.denormalize(values)
         return torch.cat([denormalized[key] for key in ACTION_KEYS], dim=-1)
 
+    def _denormalize_horizon_zero(self, action: torch.Tensor) -> torch.Tensor:
+        """Denormalize one ensembled action with the horizon-zero statistics.
+
+        Official RMBench and real-world Chronos first ensemble predictions in
+        normalized space, then interpret the result as the current (horizon
+        zero) action.  The scaler stores distinct statistics for every future
+        horizon, so denormalizing each candidate before ensembling is not the
+        same operation.
+        """
+
+        if action.shape != (self.action_dim,):
+            raise ValueError(
+                "Expected one normalized action with shape "
+                f"({self.action_dim},), got {tuple(action.shape)}"
+            )
+        sequence = action.new_zeros((1, self.future_steps, self.action_dim))
+        sequence[0, 0].copy_(action)
+        return self._denormalize_sequence(sequence)[0, 0]
+
     def _ensemble(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Temporally ensemble denormalized actions using a bounded ring."""
+        """Temporally ensemble normalized action predictions using a bounded ring."""
 
         row = self.t % self.future_steps
         self._action_ring[row].copy_(sequence)
@@ -234,12 +255,13 @@ class MambaRGBController:
             self.hiddens,
             sample_steps=self.sample_steps,
         )
-        predicted = self._denormalize_sequence(predicted_normalized)[0]
+        predicted_normalized = predicted_normalized[0]
 
         if self.temporal_agg:
-            action = self._ensemble(predicted)
+            action_normalized = self._ensemble(predicted_normalized)
         else:
-            action = predicted[self.execution_horizon_offset]
+            action_normalized = predicted_normalized[self.execution_horizon_offset]
+        action = self._denormalize_horizon_zero(action_normalized)
         self.t += 1
 
         if not torch.isfinite(action).all():
